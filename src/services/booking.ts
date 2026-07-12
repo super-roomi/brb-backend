@@ -134,7 +134,7 @@ export async function createReservation(input: {
 }
 
 // Reservations in these states occupy a chair/barber and block the slot.
-export const HOLDING_STATUSES = ["PENDING", "CONFIRMED"] as const;
+export const HOLDING_STATUSES: string[] = ["PENDING", "CONFIRMED"];
 
 export async function cancelReservation(userId: string, reservationId: string) {
   const reservation = await prisma.reservation.findUnique({ where: { id: reservationId } });
