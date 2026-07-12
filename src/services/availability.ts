@@ -1,5 +1,6 @@
 import { prisma } from "../lib/prisma.js";
 import { ApiError } from "../lib/errors.js";
+import { isShopLive } from "./booking.js";
 import { localDateToUtc, weekdayOfLocalDate } from "../lib/time.js";
 
 export const SLOT_STEP_MIN = 15;
@@ -24,9 +25,11 @@ export async function computeFreeSlots(
       openingHours: true,
       services: { where: { id: serviceId } },
       barbers: { where: { isActive: true } },
+      subscription: true,
     },
   });
-  if (!shop) throw ApiError.notFound("Barbershop not found");
+  // Don't leak availability for shops that aren't live in the app.
+  if (!shop || !isShopLive(shop)) throw ApiError.notFound("Barbershop not found");
   const service = shop.services[0];
   if (!service || !service.isActive) throw ApiError.notFound("Service not found");
 

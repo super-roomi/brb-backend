@@ -11,6 +11,8 @@ export const catalogRouter = Router();
 
 catalogRouter.get("/cities", async (_req, res) => {
   const cities = await prisma.city.findMany({ orderBy: { name: "asc" } });
+  // Cities change rarely; let clients/CDN hold this briefly.
+  res.set("Cache-Control", "public, max-age=60");
   res.json({ cities: cities.map((c) => ({ id: c.id, name: c.name, slug: c.slug })) });
 });
 
@@ -27,8 +29,14 @@ catalogRouter.get("/shops", validate(listSchema, "query"), async (req, res) => {
   const where = {
     ...liveShopWhere(),
     ...(q.cityId ? { cityId: q.cityId } : {}),
-    ...(q.search ? { name: { contains: q.search } } : {}),
+    // Postgres `contains` is case-sensitive (SQLite's LIKE was not); make search
+    // case-insensitive so "barber" matches "Barber".
+    ...(q.search ? { name: { contains: q.search, mode: "insensitive" as const } } : {}),
   };
+  // Featured-tier shops sort first across the WHOLE list, then by the requested
+  // order. Doing this in the query (not by re-sorting a page in JS) keeps
+  // featured shops on top even past page 1 — the paid tier's whole point.
+  const featuredFirst = { subscription: { plan: { isFeaturedTier: "desc" as const } } };
   const [total, shops] = await Promise.all([
     prisma.barbershop.count({ where }),
     prisma.barbershop.findMany({
@@ -39,28 +47,27 @@ catalogRouter.get("/shops", validate(listSchema, "query"), async (req, res) => {
       },
       orderBy:
         q.sort === "rating"
-          ? [{ ratingAvg: "desc" }, { ratingCount: "desc" }]
-          : [{ name: "asc" }],
+          ? [featuredFirst, { ratingAvg: "desc" }, { ratingCount: "desc" }]
+          : [featuredFirst, { name: "asc" }],
       skip: (q.page - 1) * q.pageSize,
       take: q.pageSize,
     }),
   ]);
 
-  // Featured-tier shops float to the top within the page's sort order.
-  const items = shops
-    .map((s) => ({
-      id: s.id,
-      name: s.name,
-      description: s.description,
-      address: s.address,
-      imageUrl: s.imageUrl,
-      city: s.city,
-      ratingAvg: s.ratingAvg,
-      ratingCount: s.ratingCount,
-      isFeatured: s.subscription?.plan.isFeaturedTier ?? false,
-    }))
-    .sort((a, b) => Number(b.isFeatured) - Number(a.isFeatured));
+  const items = shops.map((s) => ({
+    id: s.id,
+    name: s.name,
+    description: s.description,
+    address: s.address,
+    imageUrl: s.imageUrl,
+    city: s.city,
+    ratingAvg: s.ratingAvg,
+    ratingCount: s.ratingCount,
+    isFeatured: s.subscription?.plan.isFeaturedTier ?? false,
+  }));
 
+  // Browse traffic dwarfs writes; a short public cache absorbs repeat opens.
+  res.set("Cache-Control", "public, max-age=60");
   res.json({ shops: items, page: q.page, pageSize: q.pageSize, total });
 });
 
@@ -125,6 +132,14 @@ catalogRouter.get(
   validate(reviewsSchema, "query"),
   async (req, res) => {
     const q = parsed<z.infer<typeof reviewsSchema>>(req);
+    // Don't expose reviews for shops that aren't live (hidden/expired/never
+    // published) — same visibility rule as shop detail.
+    const shop = await prisma.barbershop.findUnique({
+      where: { id: req.params.id },
+      include: { subscription: true },
+    });
+    if (!shop || !isShopLive(shop)) throw ApiError.notFound("Barbershop not found");
+
     const where = { shopId: req.params.id };
     const [total, reviews] = await Promise.all([
       prisma.review.count({ where }),

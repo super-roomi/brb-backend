@@ -32,3 +32,14 @@ export const otpVerifyLimiter = rateLimit({
   skip,
   message: { error: { code: "RATE_LIMITED", message: "Too many attempts. Try again later." } },
 });
+
+// Admin login is a single high-value credential; throttle it hard so the
+// bcrypt cost isn't the only thing standing between an attacker and the panel.
+export const adminLoginLimiter = rateLimit({
+  windowMs: 15 * 60_000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip,
+  message: { error: { code: "RATE_LIMITED", message: "Too many login attempts. Try again later." } },
+});

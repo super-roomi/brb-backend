@@ -28,3 +28,36 @@ export function isValidDateString(s: string): boolean {
 export function addDays(d: Date, days: number): Date {
   return new Date(d.getTime() + days * 86_400_000);
 }
+
+// The [start, end) UTC instants bounding the shop-local calendar day that
+// contains `now`. Used wherever "today" must mean the shop's day, not UTC's.
+export function localDayRangeUtc(
+  now: Date,
+  utcOffsetMinutes: number,
+): { dayStart: Date; dayEnd: Date } {
+  const local = new Date(now.getTime() + utcOffsetMinutes * 60_000);
+  const dayStart = new Date(
+    Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate()) -
+      utcOffsetMinutes * 60_000,
+  );
+  const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60_000);
+  return { dayStart, dayEnd };
+}
+
+// Add whole months, clamping the day to the target month's length so a period
+// starting Jan 31 + 1 month lands on Feb 28/29 — never overflowing into March
+// (which would silently gift the subscriber extra days).
+export function addMonths(d: Date, months: number): Date {
+  const result = new Date(d.getTime());
+  const targetMonth = result.getMonth() + months;
+  const day = result.getDate();
+  result.setDate(1); // avoid overflow while we move the month
+  result.setMonth(targetMonth);
+  const daysInTargetMonth = new Date(
+    result.getFullYear(),
+    result.getMonth() + 1,
+    0,
+  ).getDate();
+  result.setDate(Math.min(day, daysInTargetMonth));
+  return result;
+}

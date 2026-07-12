@@ -31,6 +31,8 @@ class TwilioSmsProvider implements SmsProvider {
           "Content-Type": "application/x-www-form-urlencoded",
         },
         body: new URLSearchParams({ To: phone, From: this.from, Body: message }),
+        // Cap the wait so a stuck Twilio call can't hold the OTP request open.
+        signal: AbortSignal.timeout(10_000),
       },
     );
     if (!res.ok) {

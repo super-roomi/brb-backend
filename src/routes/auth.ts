@@ -10,6 +10,8 @@ import {
   OTP_MAX_ATTEMPTS,
   OTP_RESEND_COOLDOWN_MS,
   OTP_TTL_MS,
+  OTP_DAILY_MAX,
+  OTP_DAILY_WINDOW_MS,
 } from "../lib/otp.js";
 import { hashToken, newRefreshToken, signAccessToken } from "../lib/jwt.js";
 import { sms } from "../lib/sms.js";
@@ -28,24 +30,39 @@ authRouter.post(
   validate(requestSchema),
   async (req, res) => {
     const phone = normalizePhone(parsed<z.infer<typeof requestSchema>>(req).phone);
+    const now = Date.now();
 
     const latest = await prisma.otpRequest.findFirst({
       where: { phone },
       orderBy: { createdAt: "desc" },
     });
-    if (latest && Date.now() - latest.createdAt.getTime() < OTP_RESEND_COOLDOWN_MS) {
+    if (latest && now - latest.createdAt.getTime() < OTP_RESEND_COOLDOWN_MS) {
       throw ApiError.tooMany("Please wait a minute before requesting another code");
     }
 
+    // Per-phone daily cap (see OTP_DAILY_MAX). Unlike the per-IP limiter, this
+    // can't be sidestepped by rotating source IPs.
+    const sentToday = await prisma.otpRequest.count({
+      where: { phone, createdAt: { gte: new Date(now - OTP_DAILY_WINDOW_MS) } },
+    });
+    if (sentToday >= OTP_DAILY_MAX) {
+      throw ApiError.tooMany(
+        "Too many codes requested for this number today. Try again later.",
+        "OTP_DAILY_LIMIT",
+      );
+    }
+
     const code = generateOtp();
+    // Send first, persist second: a failed SMS shouldn't leave a row that
+    // blocks the resend cooldown and burns the daily cap.
+    await sms.send(phone, `Your Barber App verification code is ${code}`);
     const request = await prisma.otpRequest.create({
       data: {
         phone,
         codeHash: hashOtp(phone, code),
-        expiresAt: new Date(Date.now() + OTP_TTL_MS),
+        expiresAt: new Date(now + OTP_TTL_MS),
       },
     });
-    await sms.send(phone, `Your Barber App verification code is ${code}`);
 
     res.json({
       requestId: request.id,
@@ -120,15 +137,28 @@ authRouter.post("/refresh", validate(refreshSchema), async (req, res) => {
   const record = await prisma.refreshToken.findUnique({
     where: { tokenHash: hashToken(refreshToken) },
   });
-  if (!record || record.revokedAt || record.expiresAt < new Date()) {
+  if (!record || record.expiresAt < new Date()) {
     throw ApiError.unauthorized("Session expired, sign in again", "REFRESH_INVALID");
   }
-  // Rotation: the old token dies with each refresh, so a stolen token stops
-  // working as soon as either party uses it.
-  await prisma.refreshToken.update({
-    where: { id: record.id },
+
+  // Atomically claim the token: only the first concurrent refresh flips
+  // revokedAt from null, so two requests racing with the same token can't both
+  // be issued a fresh pair (that would defeat rotation).
+  const claimed = await prisma.refreshToken.updateMany({
+    where: { id: record.id, revokedAt: null },
     data: { revokedAt: new Date() },
   });
+  if (claimed.count === 0) {
+    // The token was already spent. Either a benign double-submit or a replay of
+    // a stolen token — in both cases revoke the user's whole token family so a
+    // thief can't keep using a newer token issued off the same lineage.
+    await prisma.refreshToken.updateMany({
+      where: { userId: record.userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+    throw ApiError.unauthorized("Session expired, sign in again", "REFRESH_INVALID");
+  }
+
   const tokens = await issueTokens(record.userId);
   res.json(tokens);
 });

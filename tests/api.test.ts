@@ -308,6 +308,41 @@ describe("reservations", () => {
   });
 });
 
+describe("reservation concurrency", () => {
+  const date = openDate();
+
+  it("lets only one of many simultaneous bookings win the same slot", async () => {
+    // Distinct users so the one-active-booking rule doesn't mask the capacity
+    // check — every request is eligible, so only slot capacity should stop the
+    // losers. Without the Serializable transaction these would all read "free"
+    // and all insert; exactly one 201 is the guarantee we're protecting.
+    const phones = [
+      "+9647500010001",
+      "+9647500010002",
+      "+9647500010003",
+      "+9647500010004",
+      "+9647500010005",
+    ];
+    const tokens = await Promise.all(phones.map((p) => newUserToken(p)));
+    const startMinute = 15 * 60; // 15:00 — not used by other reservation tests
+
+    const results = await Promise.all(
+      tokens.map((t) =>
+        request(app)
+          .post("/api/reservations")
+          .set(auth(t))
+          .send({ shopId, serviceId, date, startMinute }),
+      ),
+    );
+
+    const created = results.filter((r) => r.status === 201);
+    const conflicts = results.filter((r) => r.status === 409);
+    expect(created).toHaveLength(1);
+    expect(conflicts).toHaveLength(phones.length - 1);
+    for (const c of conflicts) expect(c.body.error.code).toBe("SLOT_TAKEN");
+  });
+});
+
 describe("reviews", () => {
   it("blocks reviews without a completed visit", async () => {
     const fresh = await newUserToken("+9647501112288");

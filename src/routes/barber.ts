@@ -4,6 +4,7 @@ import { prisma } from "../lib/prisma.js";
 import { ApiError } from "../lib/errors.js";
 import { requireUser } from "../middleware/auth.js";
 import { validate, parsed } from "../middleware/validate.js";
+import { localDayRangeUtc } from "../lib/time.js";
 
 export const barberRouter = Router();
 barberRouter.use(requireUser);
@@ -56,17 +57,24 @@ barberRouter.patch("/auto-approve", validate(autoApproveSchema), async (req, res
       where: { barberId: barber.id, status: "PENDING", endsAt: { gte: new Date() } },
       include: { shop: { select: { name: true } }, service: { select: { name: true } } },
     });
-    for (const r of pending) {
+    if (pending.length > 0) {
+      const ids = pending.map((r) => r.id);
+      // One transaction instead of N: confirm the whole backlog and write all
+      // notifications together. The status:"PENDING" guard means any request
+      // cancelled since the fetch is left alone.
       await prisma.$transaction([
-        prisma.reservation.update({ where: { id: r.id }, data: { status: "CONFIRMED" } }),
-        prisma.notification.create({
-          data: {
+        prisma.reservation.updateMany({
+          where: { id: { in: ids }, status: "PENDING" },
+          data: { status: "CONFIRMED" },
+        }),
+        prisma.notification.createMany({
+          data: pending.map((r) => ({
             userId: r.userId,
             type: "BOOKING_ACCEPTED",
             title: "Booking confirmed",
             body: `${barber.name} confirmed your ${r.service.name} at ${r.shop.name}.`,
             reservationId: r.id,
-          },
+          })),
         }),
       ]);
     }
@@ -80,8 +88,14 @@ barberRouter.get("/stats", async (req, res) => {
   if (!barber) throw ApiError.forbidden("Not registered as a barber", "NOT_A_BARBER");
 
   const now = new Date();
-  const startOfDay = new Date(now);
-  startOfDay.setUTCHours(0, 0, 0, 0);
+  // "Today" means the shop's local calendar day (matches /barber/today), not
+  // UTC's — otherwise, between 00:00 and 03:00 local (UTC+3), this tab and the
+  // Today tab disagree about which day it is.
+  const shop = await prisma.barbershop.findUnique({
+    where: { id: barber.shopId },
+    select: { utcOffsetMinutes: true },
+  });
+  const { dayStart, dayEnd } = localDayRangeUtc(now, shop?.utcOffsetMinutes ?? 180);
 
   const [completedAgg, todayCount, upcomingCount, recent] = await Promise.all([
     // Earnings + lifetime cut count from completed (past, confirmed) bookings.
@@ -94,7 +108,7 @@ barberRouter.get("/stats", async (req, res) => {
       where: {
         barberId: barber.id,
         status: "CONFIRMED",
-        startsAt: { gte: startOfDay },
+        startsAt: { gte: dayStart, lt: dayEnd },
       },
     }),
     prisma.reservation.count({
@@ -142,12 +156,7 @@ barberRouter.get("/today", async (req, res) => {
   });
   const offset = shop?.utcOffsetMinutes ?? 180;
   const now = new Date();
-  // Local midnight → UTC: shift by the offset. [dayStart, dayStart+24h).
-  const local = new Date(now.getTime() + offset * 60_000);
-  const dayStart = new Date(
-    Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate()) - offset * 60_000,
-  );
-  const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60_000);
+  const { dayStart, dayEnd } = localDayRangeUtc(now, offset);
 
   const appts = await prisma.reservation.findMany({
     where: {
@@ -210,39 +219,52 @@ barberRouter.get("/customers", async (req, res) => {
   const barber = await barberForRequest(req.auth!.userId);
   if (!barber) throw ApiError.forbidden("Not registered as a barber", "NOT_A_BARBER");
 
-  const rows = await prisma.reservation.findMany({
-    where: { barberId: barber.id, status: { in: ["PENDING", "CONFIRMED"] } },
-    include: { user: { select: { id: true, name: true, phone: true } } },
-    orderBy: { startsAt: "desc" },
-    take: 200,
+  const now = new Date();
+  // Aggregate in the database, not by scanning a capped page of reservations
+  // (the old take:200 silently stopped counting a busy barber's history after
+  // ~a month). Two grouped queries: recency across all live bookings, and
+  // completed-visit counts/spend.
+  const [recency, completed] = await Promise.all([
+    prisma.reservation.groupBy({
+      by: ["userId"],
+      where: { barberId: barber.id, status: { in: ["PENDING", "CONFIRMED"] } },
+      _max: { startsAt: true },
+    }),
+    prisma.reservation.groupBy({
+      by: ["userId"],
+      where: { barberId: barber.id, status: "CONFIRMED", endsAt: { lt: now } },
+      _count: { _all: true },
+      _sum: { price: true },
+    }),
+  ]);
+
+  const completedByUser = new Map(completed.map((c) => [c.userId, c]));
+  // Most recently seen customers first; cap the returned list, not the scan.
+  const top = recency
+    .sort(
+      (a, b) => (b._max.startsAt?.getTime() ?? 0) - (a._max.startsAt?.getTime() ?? 0),
+    )
+    .slice(0, 200);
+
+  const users = await prisma.user.findMany({
+    where: { id: { in: top.map((r) => r.userId) } },
+    select: { id: true, name: true, phone: true },
+  });
+  const userById = new Map(users.map((u) => [u.id, u]));
+
+  const customers = top.map((r) => {
+    const u = userById.get(r.userId);
+    const c = completedByUser.get(r.userId);
+    return {
+      name: u?.name ?? u?.phone ?? "Customer",
+      phone: u?.phone ?? "",
+      visits: c?._count._all ?? 0,
+      lastVisit: (r._max.startsAt ?? now).toISOString(),
+      spent: c?._sum.price ?? 0,
+    };
   });
 
-  const now = new Date();
-  const byCustomer = new Map<
-    string,
-    { name: string; phone: string; visits: number; lastVisit: string; spent: number }
-  >();
-  for (const r of rows) {
-    const key = r.user.id;
-    const done = r.status === "CONFIRMED" && r.endsAt < now;
-    const existing = byCustomer.get(key);
-    if (existing) {
-      if (done) {
-        existing.visits += 1;
-        existing.spent += r.price;
-      }
-    } else {
-      byCustomer.set(key, {
-        name: r.user.name ?? r.user.phone,
-        phone: r.user.phone,
-        visits: done ? 1 : 0,
-        lastVisit: r.startsAt.toISOString(),
-        spent: done ? r.price : 0,
-      });
-    }
-  }
-
-  res.json({ customers: [...byCustomer.values()] });
+  res.json({ customers });
 });
 
 barberRouter.post("/reservations/:id/accept", async (req, res) => {
@@ -280,9 +302,19 @@ async function decideReservation(
   const accepted = action === "accept";
   const status = accepted ? "CONFIRMED" : "DECLINED";
 
-  await prisma.$transaction([
-    prisma.reservation.update({ where: { id: reservationId }, data: { status } }),
-    prisma.notification.create({
+  // Compare-and-swap inside the transaction: the decision only lands if the
+  // reservation is still PENDING. If the customer cancelled between our read
+  // and here, updateMany matches zero rows — we abort rather than resurrect a
+  // cancelled booking and fire a bogus notification.
+  await prisma.$transaction(async (tx) => {
+    const updated = await tx.reservation.updateMany({
+      where: { id: reservationId, barberId: barber.id, status: "PENDING" },
+      data: { status },
+    });
+    if (updated.count === 0) {
+      throw ApiError.badRequest("This request was already handled", "ALREADY_DECIDED");
+    }
+    await tx.notification.create({
       data: {
         userId: reservation.userId,
         type: accepted ? "BOOKING_ACCEPTED" : "BOOKING_DECLINED",
@@ -292,8 +324,8 @@ async function decideReservation(
           : `${barber.name} could not take your ${reservation.service.name} at ${reservation.shop.name}. Please pick another time.`,
         reservationId: reservation.id,
       },
-    }),
-  ]);
+    });
+  });
 
   return { id: reservation.id, status };
 }

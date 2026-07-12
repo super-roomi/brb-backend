@@ -1,18 +1,23 @@
 import { Router } from "express";
 import { z } from "zod";
 import bcrypt from "bcryptjs";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { ApiError } from "../lib/errors.js";
 import { signAccessToken } from "../lib/jwt.js";
 import { requireAdmin } from "../middleware/auth.js";
 import { validate, parsed } from "../middleware/validate.js";
 import { isShopLive } from "../services/booking.js";
+import { tryNormalizePhone } from "../lib/phone.js";
+import { adminLoginLimiter } from "../middleware/rateLimit.js";
+import { addMonths } from "../lib/time.js";
+import { env } from "../env.js";
 
 export const adminRouter = Router();
 
 const loginSchema = z.object({ email: z.string().email(), password: z.string().min(8) });
 
-adminRouter.post("/login", validate(loginSchema), async (req, res) => {
+adminRouter.post("/login", adminLoginLimiter, validate(loginSchema), async (req, res) => {
   const { email, password } = parsed<z.infer<typeof loginSchema>>(req);
   const admin = await prisma.adminUser.findUnique({ where: { email } });
   // Same error for unknown email and wrong password — no account probing.
@@ -20,7 +25,7 @@ adminRouter.post("/login", validate(loginSchema), async (req, res) => {
     throw ApiError.unauthorized("Invalid credentials", "BAD_CREDENTIALS");
   }
   res.json({
-    accessToken: signAccessToken({ sub: admin.id, role: "admin" }),
+    accessToken: signAccessToken({ sub: admin.id, role: "admin" }, env.adminAccessTtl),
     admin: { id: admin.id, email: admin.email, name: admin.name },
   });
 });
@@ -92,7 +97,26 @@ const serviceSchema = z.object({
 const barberSchema = z.object({
   id: z.string().optional(), // present = update existing
   name: z.string().trim().min(2).max(60),
-  phone: z.string().trim().min(8).max(20),
+  // Normalize to canonical E.164 at the boundary. A barber logs into the mobile
+  // app with this number, and the barber-identity lookup is exact string
+  // equality against the User's (already-normalized) phone — so an un-normalized
+  // stored phone would silently lock the barber out of their dashboard.
+  phone: z
+    .string()
+    .trim()
+    .min(8)
+    .max(20)
+    .transform((v, ctx) => {
+      const normalized = tryNormalizePhone(v);
+      if (!normalized) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Phone must be in international format, e.g. +9647501234567",
+        });
+        return z.NEVER;
+      }
+      return normalized;
+    }),
   isActive: z.boolean().default(true),
 });
 
@@ -181,43 +205,59 @@ adminRouter.post("/shops", validate(shopBase), async (req, res) => {
 
   await assertBarberPhonesFree(body.barbers ?? []);
 
-  const shop = await prisma.barbershop.create({
-    data: {
-      name: body.name,
-      description: body.description,
-      address: body.address,
-      phone: body.phone,
-      imageUrl: body.imageUrl ?? null,
-      cityId: body.cityId,
-      chairCount: body.chairCount,
-      utcOffsetMinutes: body.utcOffsetMinutes,
-      latitude: body.latitude ?? null,
-      longitude: body.longitude ?? null,
-      instagramUrl: emptyToNull(body.instagramUrl) ?? null,
-      facebookUrl: emptyToNull(body.facebookUrl) ?? null,
-      tiktokUrl: emptyToNull(body.tiktokUrl) ?? null,
-      snapchatUrl: emptyToNull(body.snapchatUrl) ?? null,
-      isVisible: false, // new shops start hidden until the admin flips them on
-      services: {
-        create: body.services.map((s) => ({
-          name: s.name,
-          durationMin: s.durationMin,
-          price: s.price,
-          isActive: s.isActive,
-        })),
+  const shop = await prisma.barbershop
+    .create({
+      data: {
+        name: body.name,
+        description: body.description,
+        address: body.address,
+        phone: body.phone,
+        imageUrl: body.imageUrl ?? null,
+        cityId: body.cityId,
+        chairCount: body.chairCount,
+        utcOffsetMinutes: body.utcOffsetMinutes,
+        latitude: body.latitude ?? null,
+        longitude: body.longitude ?? null,
+        instagramUrl: emptyToNull(body.instagramUrl) ?? null,
+        facebookUrl: emptyToNull(body.facebookUrl) ?? null,
+        tiktokUrl: emptyToNull(body.tiktokUrl) ?? null,
+        snapchatUrl: emptyToNull(body.snapchatUrl) ?? null,
+        isVisible: false, // new shops start hidden until the admin flips them on
+        services: {
+          create: body.services.map((s) => ({
+            name: s.name,
+            durationMin: s.durationMin,
+            price: s.price,
+            isActive: s.isActive,
+          })),
+        },
+        openingHours: { create: body.openingHours },
+        barbers: {
+          create: (body.barbers ?? []).map((b) => ({
+            name: b.name,
+            phone: b.phone,
+            isActive: b.isActive,
+          })),
+        },
       },
-      openingHours: { create: body.openingHours },
-      barbers: {
-        create: (body.barbers ?? []).map((b) => ({
-          name: b.name,
-          phone: b.phone,
-          isActive: b.isActive,
-        })),
-      },
-    },
-  });
+    })
+    .catch(rethrowBarberPhoneConflict);
   res.status(201).json({ shop: { id: shop.id } });
 });
+
+// The pre-check below narrows most conflicts to a friendly 409, but two admins
+// saving the same new phone concurrently can still slip past it and hit the DB
+// unique constraint. Translate that P2002 into the same 409 instead of a 500.
+function rethrowBarberPhoneConflict(e: unknown): never {
+  if (
+    e instanceof Prisma.PrismaClientKnownRequestError &&
+    e.code === "P2002" &&
+    String(e.meta?.target ?? "").includes("phone")
+  ) {
+    throw ApiError.conflict("That barber phone is already in use", "BARBER_PHONE_TAKEN");
+  }
+  throw e;
+}
 
 // A barber phone must be unique across the whole platform (it is a login).
 async function assertBarberPhonesFree(
@@ -285,8 +325,10 @@ adminRouter.patch("/shops/:id", validate(shopBase.partial()), async (req, res) =
       });
       for (const s of body.services) {
         if (s.id) {
-          await tx.service.update({
-            where: { id: s.id },
+          // Scope by shopId so a crafted payload can't edit another shop's
+          // service by id. updateMany (not update) lets us match on both.
+          await tx.service.updateMany({
+            where: { id: s.id, shopId: existing.id },
             data: { name: s.name, durationMin: s.durationMin, price: s.price, isActive: s.isActive },
           });
         } else {
@@ -312,8 +354,9 @@ adminRouter.patch("/shops/:id", validate(shopBase.partial()), async (req, res) =
       });
       for (const b of body.barbers) {
         if (b.id) {
-          await tx.barber.update({
-            where: { id: b.id },
+          // Scope by shopId (see services above): no cross-shop id edits.
+          await tx.barber.updateMany({
+            where: { id: b.id, shopId: existing.id },
             data: { name: b.name, phone: b.phone, isActive: b.isActive },
           });
         } else {
@@ -323,7 +366,7 @@ adminRouter.patch("/shops/:id", validate(shopBase.partial()), async (req, res) =
         }
       }
     }
-  });
+  }).catch(rethrowBarberPhoneConflict);
   res.json({ ok: true });
 });
 
@@ -405,8 +448,7 @@ adminRouter.put("/shops/:id/subscription", validate(subSchema), async (req, res)
     shop.subscription.currentPeriodEnd > now
       ? shop.subscription.currentPeriodEnd
       : now;
-  const end = new Date(base);
-  end.setMonth(end.getMonth() + months);
+  const end = addMonths(base, months);
 
   const subscription = await prisma.subscription.upsert({
     where: { shopId: shop.id },

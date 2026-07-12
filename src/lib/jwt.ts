@@ -5,10 +5,10 @@ import { ApiError } from "./errors.js";
 
 export type AccessClaims = { sub: string; role: "user" | "admin" };
 
-export function signAccessToken(claims: AccessClaims): string {
+export function signAccessToken(claims: AccessClaims, expiresIn = env.accessTtl): string {
   return jwt.sign({ role: claims.role }, env.accessSecret, {
     subject: claims.sub,
-    expiresIn: env.accessTtl,
+    expiresIn,
     audience: "barber-api",
   } as jwt.SignOptions);
 }

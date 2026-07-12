@@ -1,0 +1,63 @@
+name: CI
+
+# Runs on every push and pull request. This workflow lives at the root of the
+# backend repo (github.com/super-roomi/brb-backend), so paths are relative to
+# the backend, with no `cd`.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# A newer push to the same branch/PR cancels the older, still-running job.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Typecheck & test
+    runs-on: ubuntu-latest
+
+    # Throwaway Postgres for the (destructive) test suite. The database name
+    # contains "test", which the pretest guard (scripts/assert-test-db.mjs)
+    # requires before it will run `prisma migrate reset`.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: barberapp_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # Points at the service container above. Superuser can CREATE EXTENSION
+      # btree_gist, which the reservation-overlap migration needs.
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/barberapp_test?schema=public
+      # A real (non-placeholder) secret so nothing falls back to the dev default.
+      JWT_ACCESS_SECRET: ci-test-secret-not-used-in-prod
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck (prisma generate + tsc)
+        run: npm run build
+
+      - name: Test
+        # pretest applies all migrations to the fresh service DB, then vitest
+        # runs the suite (NODE_ENV=test is set by the test script's cross-env).
+        run: npm test

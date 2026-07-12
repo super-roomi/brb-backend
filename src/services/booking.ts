@@ -1,9 +1,29 @@
+import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { ApiError } from "../lib/errors.js";
 import { addDays, localDateToUtc, weekdayOfLocalDate } from "../lib/time.js";
 import { BOOKING_HORIZON_DAYS, BOOKING_LEAD_MIN, SLOT_STEP_MIN } from "./availability.js";
 
 export const CANCEL_CUTOFF_MIN = 120; // cancellations allowed until 2h before start
+
+// How many times to retry a booking transaction that aborted because a
+// concurrent booking touched the same rows (Serializable serialization
+// failure). Bookings are low-QPS writes, so a few retries cost nothing.
+const MAX_BOOKING_RETRIES = 3;
+
+// P2034: "write conflict or deadlock, please retry" — what a Serializable
+// transaction raises when it loses a race. Safe to retry.
+function isRetryableTxError(e: unknown): boolean {
+  return e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2034";
+}
+
+// Postgres exclusion_violation (SQLSTATE 23P01) from the reservation-overlap
+// constraint (see migration). This is the DB-level backstop firing; surface it
+// as the same friendly conflict the app already knows how to handle.
+function isOverlapExclusionViolation(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return msg.includes("no_barber_overlap") || msg.includes("23P01");
+}
 
 export async function createReservation(input: {
   userId: string;
@@ -65,76 +85,132 @@ export async function createReservation(input: {
     );
   }
 
-  // Capacity check and insert in one transaction. SQLite serializes writers;
-  // on PostgreSQL this transaction plus the (shopId, startsAt) index keeps the
-  // race window negligible — belt-and-braces is an exclusion constraint (see
-  // ARCHITECTURE.md).
-  return prisma.$transaction(async (tx) => {
-    // A customer may hold only one active booking at a time: any pending or
-    // confirmed reservation that hasn't finished yet blocks a new one.
-    const active = await tx.reservation.count({
-      where: {
-        userId,
-        status: { in: HOLDING_STATUSES },
-        endsAt: { gt: new Date() },
-      },
-    });
-    if (active > 0) {
-      throw ApiError.conflict(
-        "You already have an active booking. Cancel it before booking again.",
-        "ONE_ACTIVE_BOOKING",
-      );
-    }
-
-    const overlapping = await tx.reservation.findMany({
-      where: {
-        shopId,
-        status: { in: HOLDING_STATUSES },
-        startsAt: { lt: endsAt },
-        endsAt: { gt: startsAt },
-      },
-      select: { barberId: true },
-    });
-
-    let assignedBarberId: string | null = null;
-    // Confirm immediately when the assigned barber has auto-approve on;
-    // otherwise the request waits in their queue.
-    let autoApprove = false;
-    if (useBarbers) {
-      // Pick the first eligible barber with no overlapping booking. For "any
-      // available" eligible = all active barbers; for a specific request it is
-      // that one barber, so this doubles as the capacity check.
-      const taken = new Set(overlapping.map((r) => r.barberId));
-      const free = eligible.find((b) => !taken.has(b.id));
-      if (!free) {
-        throw ApiError.conflict(
-          barberId
-            ? "That barber was just booked. Pick another time or barber."
-            : "That time was just taken. Pick another slot.",
-          "SLOT_TAKEN",
-        );
-      }
-      assignedBarberId = free.id;
-      autoApprove = free.autoApprove;
-    } else if (overlapping.length >= shop.chairCount) {
-      throw ApiError.conflict("That time was just taken. Pick another slot.", "SLOT_TAKEN");
-    }
-
-    return tx.reservation.create({
-      data: {
+  // Capacity check and insert must be atomic against concurrent bookings for
+  // the same slot. Under Postgres' default READ COMMITTED, two requests can
+  // both read "slot free" and both insert; Serializable isolation makes one of
+  // them abort with a serialization failure instead, which we retry. The
+  // exclusion constraint in the migration is the DB-level backstop if this ever
+  // slips (e.g. a path that forgets the isolation level).
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await runBookingTx({
         userId,
         shopId,
         serviceId,
-        barberId: assignedBarberId,
-        price: service.price,
         startsAt,
         endsAt,
-        // PENDING waits for the barber; CONFIRMED when they auto-approve.
-        status: autoApprove ? "CONFIRMED" : "PENDING",
-      },
-      include: reservationInclude,
-    });
-  });
+        useBarbers,
+        eligible,
+        chairCount: shop.chairCount,
+        servicePrice: service.price,
+        specificBarber: barberId,
+      });
+    } catch (e) {
+      if (isRetryableTxError(e) && attempt < MAX_BOOKING_RETRIES) continue;
+      if (isOverlapExclusionViolation(e)) {
+        throw ApiError.conflict("That time was just taken. Pick another slot.", "SLOT_TAKEN");
+      }
+      throw e;
+    }
+  }
+}
+
+// The transactional core of createReservation, isolated so the retry loop above
+// can re-run it verbatim on a serialization failure.
+function runBookingTx(args: {
+  userId: string;
+  shopId: string;
+  serviceId: string;
+  startsAt: Date;
+  endsAt: Date;
+  useBarbers: boolean;
+  eligible: { id: string; autoApprove: boolean }[];
+  chairCount: number;
+  servicePrice: number;
+  specificBarber?: string;
+}) {
+  const {
+    userId,
+    shopId,
+    serviceId,
+    startsAt,
+    endsAt,
+    useBarbers,
+    eligible,
+    chairCount,
+    servicePrice,
+    specificBarber,
+  } = args;
+
+  return prisma.$transaction(
+    async (tx) => {
+      // A customer may hold only one active booking at a time: any pending or
+      // confirmed reservation that hasn't finished yet blocks a new one.
+      const active = await tx.reservation.count({
+        where: {
+          userId,
+          status: { in: HOLDING_STATUSES },
+          endsAt: { gt: new Date() },
+        },
+      });
+      if (active > 0) {
+        throw ApiError.conflict(
+          "You already have an active booking. Cancel it before booking again.",
+          "ONE_ACTIVE_BOOKING",
+        );
+      }
+
+      const overlapping = await tx.reservation.findMany({
+        where: {
+          shopId,
+          status: { in: HOLDING_STATUSES },
+          startsAt: { lt: endsAt },
+          endsAt: { gt: startsAt },
+        },
+        select: { barberId: true },
+      });
+
+      let assignedBarberId: string | null = null;
+      // Confirm immediately when the assigned barber has auto-approve on;
+      // otherwise the request waits in their queue.
+      let autoApprove = false;
+      if (useBarbers) {
+        // Pick the first eligible barber with no overlapping booking. For "any
+        // available" eligible = all active barbers; for a specific request it is
+        // that one barber, so this doubles as the capacity check.
+        const taken = new Set(overlapping.map((r) => r.barberId));
+        const free = eligible.find((b) => !taken.has(b.id));
+        if (!free) {
+          throw ApiError.conflict(
+            specificBarber
+              ? "That barber was just booked. Pick another time or barber."
+              : "That time was just taken. Pick another slot.",
+            "SLOT_TAKEN",
+          );
+        }
+        assignedBarberId = free.id;
+        autoApprove = free.autoApprove;
+      } else if (overlapping.length >= chairCount) {
+        throw ApiError.conflict("That time was just taken. Pick another slot.", "SLOT_TAKEN");
+      }
+
+      return tx.reservation.create({
+        data: {
+          userId,
+          shopId,
+          serviceId,
+          barberId: assignedBarberId,
+          price: servicePrice,
+          startsAt,
+          endsAt,
+          // PENDING waits for the barber; CONFIRMED when they auto-approve.
+          status: autoApprove ? "CONFIRMED" : "PENDING",
+        },
+        include: reservationInclude,
+      });
+    },
+    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+  );
 }
 
 // Reservations in these states occupy a chair/barber and block the slot.
@@ -159,9 +235,21 @@ export async function cancelReservation(userId: string, reservationId: string) {
       "CANCEL_CUTOFF",
     );
   }
-  return prisma.reservation.update({
-    where: { id: reservationId },
+  // Compare-and-swap on the status we validated: if a barber accepted or the
+  // request was otherwise decided between our read and this write, no row
+  // matches and we report the conflict instead of clobbering the new state.
+  const updated = await prisma.reservation.updateMany({
+    where: { id: reservationId, userId, status: reservation.status },
     data: { status: "CANCELLED" },
+  });
+  if (updated.count === 0) {
+    throw ApiError.conflict(
+      "This reservation just changed. Refresh and try again.",
+      "RESERVATION_CHANGED",
+    );
+  }
+  return prisma.reservation.findUniqueOrThrow({
+    where: { id: reservationId },
     include: reservationInclude,
   });
 }
