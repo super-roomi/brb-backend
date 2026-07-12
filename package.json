@@ -6,13 +6,13 @@
   "description": "Barbershop reservation platform API",
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "start": "node dist/server.js",
+    "start": "prisma migrate deploy && node dist/server.js",
     "build": "prisma generate && tsc",
-    "db:push": "prisma db push",
+    "db:migrate": "prisma migrate dev",
     "db:seed": "tsx prisma/seed.ts",
-    "db:reset": "prisma db push --force-reset && tsx prisma/seed.ts",
-    "pretest": "cross-env DATABASE_URL=file:./test.db prisma db push --force-reset",
-    "test": "cross-env DATABASE_URL=file:./test.db NODE_ENV=test vitest run"
+    "db:reset": "prisma migrate reset --force",
+    "pretest": "prisma migrate reset --force --skip-seed --skip-generate",
+    "test": "cross-env NODE_ENV=test vitest run"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
@@ -27,6 +27,7 @@
     "express-rate-limit": "^7.4.1",
     "helmet": "^7.2.0",
     "jsonwebtoken": "^9.0.2",
+    "prisma": "^5.22.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
@@ -37,7 +38,6 @@
     "@types/node": "^22.9.0",
     "@types/supertest": "^6.0.2",
     "cross-env": "^7.0.3",
-    "prisma": "^5.22.0",
     "supertest": "^7.0.0",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3",

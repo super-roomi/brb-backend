@@ -1,15 +1,15 @@
 // Barbershop reservation platform — data model.
 //
-// SQLite in development (zero-setup). For production switch the datasource
-// provider to "postgresql" — the schema is written to be compatible with both:
-// enum-like fields are Strings validated with Zod at the API boundary.
+// PostgreSQL. Enum-like fields are Strings validated with Zod at the API
+// boundary. Schema changes go through `prisma migrate dev`; deploys run
+// `prisma migrate deploy` (wired into `npm start`).
 
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
