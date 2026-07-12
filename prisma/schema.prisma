@@ -1,0 +1,230 @@
+// Barbershop reservation platform — data model.
+//
+// SQLite in development (zero-setup). For production switch the datasource
+// provider to "postgresql" — the schema is written to be compatible with both:
+// enum-like fields are Strings validated with Zod at the API boundary.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model City {
+  id        String       @id @default(cuid())
+  name      String       @unique
+  slug      String       @unique
+  createdAt DateTime     @default(now())
+  shops     Barbershop[]
+}
+
+model User {
+  id            String         @id @default(cuid())
+  phone         String         @unique // E.164, e.g. +9647501234567
+  name          String?
+  createdAt     DateTime       @default(now())
+  reservations  Reservation[]
+  reviews       Review[]
+  refreshTokens RefreshToken[]
+  notifications Notification[]
+}
+
+model AdminUser {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  createdAt    DateTime @default(now())
+}
+
+model OtpRequest {
+  id          String   @id @default(cuid())
+  phone       String
+  codeHash    String
+  expiresAt   DateTime
+  attempts    Int      @default(0)
+  consumedAt  DateTime?
+  createdAt   DateTime @default(now())
+
+  @@index([phone, createdAt])
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model Barbershop {
+  id               String        @id @default(cuid())
+  name             String
+  description      String
+  address          String
+  phone            String
+  imageUrl         String?
+  cityId           String
+  city             City          @relation(fields: [cityId], references: [id])
+  // Number of chairs = how many reservations can overlap at one time.
+  chairCount       Int           @default(1)
+  // Wall-clock offset for the shop's locale (Iraq: UTC+3, no DST).
+  utcOffsetMinutes Int           @default(180)
+  isVisible        Boolean       @default(false)
+  // Map location (nullable — shown on the customer app when both are set).
+  latitude         Float?
+  longitude        Float?
+  // Social media links (nullable — shops may set any subset).
+  instagramUrl     String?
+  facebookUrl      String?
+  tiktokUrl        String?
+  snapchatUrl      String?
+  // Denormalized rating aggregate, maintained transactionally on review writes.
+  ratingAvg        Float         @default(0)
+  ratingCount      Int           @default(0)
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  services         Service[]
+  openingHours     OpeningHour[]
+  barbers          Barber[]
+  reservations     Reservation[]
+  reviews          Review[]
+  subscription     Subscription?
+
+  @@index([cityId, isVisible])
+}
+
+model Service {
+  id           String        @id @default(cuid())
+  shopId       String
+  shop         Barbershop    @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  name         String
+  // Duration in minutes; price as integer in smallest currency unit (IQD has none).
+  durationMin  Int
+  price        Int
+  isActive     Boolean       @default(true)
+  reservations Reservation[]
+
+  @@index([shopId])
+}
+
+model OpeningHour {
+  id          String     @id @default(cuid())
+  shopId      String
+  shop        Barbershop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  // 0 = Sunday … 6 = Saturday. Times are minutes from local midnight.
+  weekday     Int
+  openMinute  Int
+  closeMinute Int
+
+  @@unique([shopId, weekday])
+}
+
+model Barber {
+  id           String        @id @default(cuid())
+  shopId       String
+  shop         Barbershop    @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  name         String
+  // E.164, unique across all barbers. A barber logs into the mobile app with
+  // this number (same phone+OTP flow as customers) to see their own stats.
+  phone        String        @unique
+  isActive     Boolean       @default(true)
+  createdAt    DateTime      @default(now())
+  reservations Reservation[]
+
+  @@index([shopId])
+}
+
+model Reservation {
+  id        String     @id @default(cuid())
+  userId    String
+  user      User       @relation(fields: [userId], references: [id])
+  shopId    String
+  shop      Barbershop @relation(fields: [shopId], references: [id])
+  serviceId String
+  service   Service    @relation(fields: [serviceId], references: [id])
+  // Every booking is assigned to a specific barber (chosen or auto-assigned
+  // from "any available"). Nullable only to tolerate pre-barber legacy rows.
+  barberId  String?
+  barber    Barber?    @relation(fields: [barberId], references: [id])
+  // Price frozen at booking time so barber earnings stay correct if the
+  // service price later changes.
+  price     Int        @default(0)
+  // UTC instants; duration frozen from the service at booking time.
+  startsAt  DateTime
+  endsAt    DateTime
+  // PENDING (awaiting barber) | CONFIRMED (accepted) | DECLINED (rejected by
+  // barber) | CANCELLED (by customer). Past CONFIRMED counts as completed.
+  // PENDING and CONFIRMED both hold the slot.
+  status    String     @default("PENDING")
+  createdAt DateTime   @default(now())
+
+  @@index([shopId, startsAt])
+  @@index([userId, startsAt])
+  @@index([barberId, status, startsAt])
+}
+
+model Notification {
+  id            String      @id @default(cuid())
+  userId        String
+  user          User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // BOOKING_ACCEPTED | BOOKING_DECLINED
+  type          String
+  title         String
+  body          String
+  reservationId String?
+  readAt        DateTime?
+  createdAt     DateTime    @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model Review {
+  id        String     @id @default(cuid())
+  userId    String
+  user      User       @relation(fields: [userId], references: [id])
+  shopId    String
+  shop      Barbershop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  rating    Int // 1..5
+  comment   String
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  @@unique([userId, shopId])
+  @@index([shopId, createdAt])
+}
+
+model Plan {
+  id            String         @id @default(cuid())
+  name          String         @unique
+  // Monthly price, integer currency units.
+  monthlyPrice  Int
+  // Marketing bullet points, newline-separated.
+  features      String
+  // Featured shops sort first in the app list.
+  isFeaturedTier Boolean       @default(false)
+  isActive      Boolean        @default(true)
+  createdAt     DateTime       @default(now())
+  subscriptions Subscription[]
+}
+
+model Subscription {
+  id                 String     @id @default(cuid())
+  shopId             String     @unique
+  shop               Barbershop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  planId             String
+  plan               Plan       @relation(fields: [planId], references: [id])
+  // ACTIVE | CANCELLED  (expiry is derived from currentPeriodEnd)
+  status             String     @default("ACTIVE")
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @updatedAt
+}
