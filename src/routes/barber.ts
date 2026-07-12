@@ -1,7 +1,9 @@
 import { Router } from "express";
+import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
 import { ApiError } from "../lib/errors.js";
 import { requireUser } from "../middleware/auth.js";
+import { validate, parsed } from "../middleware/validate.js";
 
 export const barberRouter = Router();
 barberRouter.use(requireUser);
@@ -28,8 +30,49 @@ barberRouter.get("/me", async (req, res) => {
   }
   res.json({
     isBarber: true,
-    barber: { id: barber.id, name: barber.name, shop: barber.shop },
+    barber: {
+      id: barber.id,
+      name: barber.name,
+      shop: barber.shop,
+      autoApprove: barber.autoApprove,
+    },
   });
+});
+
+// Toggle auto-approve. Turning it ON also confirms every request already
+// waiting in the queue (and notifies those customers).
+const autoApproveSchema = z.object({ enabled: z.boolean() });
+
+barberRouter.patch("/auto-approve", validate(autoApproveSchema), async (req, res) => {
+  const barber = await barberForRequest(req.auth!.userId);
+  if (!barber) throw ApiError.forbidden("Not registered as a barber", "NOT_A_BARBER");
+  const { enabled } = parsed<z.infer<typeof autoApproveSchema>>(req);
+
+  await prisma.barber.update({ where: { id: barber.id }, data: { autoApprove: enabled } });
+
+  let approved = 0;
+  if (enabled) {
+    const pending = await prisma.reservation.findMany({
+      where: { barberId: barber.id, status: "PENDING", endsAt: { gte: new Date() } },
+      include: { shop: { select: { name: true } }, service: { select: { name: true } } },
+    });
+    for (const r of pending) {
+      await prisma.$transaction([
+        prisma.reservation.update({ where: { id: r.id }, data: { status: "CONFIRMED" } }),
+        prisma.notification.create({
+          data: {
+            userId: r.userId,
+            type: "BOOKING_ACCEPTED",
+            title: "Booking confirmed",
+            body: `${barber.name} confirmed your ${r.service.name} at ${r.shop.name}.`,
+            reservationId: r.id,
+          },
+        }),
+      ]);
+    }
+    approved = pending.length;
+  }
+  res.json({ autoApprove: enabled, approved });
 });
 
 barberRouter.get("/stats", async (req, res) => {
@@ -83,6 +126,52 @@ barberRouter.get("/stats", async (req, res) => {
       price: r.price,
       startsAt: r.startsAt.toISOString(),
       status: r.status === "CONFIRMED" && r.endsAt < now ? "COMPLETED" : r.status,
+    })),
+  });
+});
+
+// Today's confirmed appointments for this barber (the barber's main view),
+// soonest first. "Today" is the shop's local calendar day.
+barberRouter.get("/today", async (req, res) => {
+  const barber = await barberForRequest(req.auth!.userId);
+  if (!barber) throw ApiError.forbidden("Not registered as a barber", "NOT_A_BARBER");
+
+  const shop = await prisma.barbershop.findUnique({
+    where: { id: barber.shopId },
+    select: { utcOffsetMinutes: true },
+  });
+  const offset = shop?.utcOffsetMinutes ?? 180;
+  const now = new Date();
+  // Local midnight → UTC: shift by the offset. [dayStart, dayStart+24h).
+  const local = new Date(now.getTime() + offset * 60_000);
+  const dayStart = new Date(
+    Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate()) - offset * 60_000,
+  );
+  const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60_000);
+
+  const appts = await prisma.reservation.findMany({
+    where: {
+      barberId: barber.id,
+      status: "CONFIRMED",
+      startsAt: { gte: dayStart, lt: dayEnd },
+    },
+    include: {
+      service: { select: { name: true, durationMin: true } },
+      user: { select: { name: true, phone: true } },
+    },
+    orderBy: { startsAt: "asc" },
+  });
+
+  res.json({
+    utcOffsetMinutes: offset,
+    appointments: appts.map((r) => ({
+      id: r.id,
+      serviceName: r.service.name,
+      durationMin: r.service.durationMin,
+      customerName: r.user.name ?? r.user.phone,
+      price: r.price,
+      startsAt: r.startsAt.toISOString(),
+      done: r.endsAt < now,
     })),
   });
 });

@@ -136,6 +136,9 @@ model Barber {
   // this number (same phone+OTP flow as customers) to see their own stats.
   phone        String        @unique
   isActive     Boolean       @default(true)
+  // When true, incoming booking requests for this barber are confirmed
+  // automatically instead of waiting in the requests queue.
+  autoApprove  Boolean       @default(false)
   createdAt    DateTime      @default(now())
   reservations Reservation[]
 

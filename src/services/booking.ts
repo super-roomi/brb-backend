@@ -97,6 +97,9 @@ export async function createReservation(input: {
     });
 
     let assignedBarberId: string | null = null;
+    // Confirm immediately when the assigned barber has auto-approve on;
+    // otherwise the request waits in their queue.
+    let autoApprove = false;
     if (useBarbers) {
       // Pick the first eligible barber with no overlapping booking. For "any
       // available" eligible = all active barbers; for a specific request it is
@@ -112,6 +115,7 @@ export async function createReservation(input: {
         );
       }
       assignedBarberId = free.id;
+      autoApprove = free.autoApprove;
     } else if (overlapping.length >= shop.chairCount) {
       throw ApiError.conflict("That time was just taken. Pick another slot.", "SLOT_TAKEN");
     }
@@ -125,8 +129,8 @@ export async function createReservation(input: {
         price: service.price,
         startsAt,
         endsAt,
-        // Awaits the assigned barber's approval.
-        status: "PENDING",
+        // PENDING waits for the barber; CONFIRMED when they auto-approve.
+        status: autoApprove ? "CONFIRMED" : "PENDING",
       },
       include: reservationInclude,
     });

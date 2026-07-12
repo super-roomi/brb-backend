@@ -350,6 +350,77 @@ describe("booking approval workflow", () => {
     expect(third.status).toBe(201);
   });
 
+  it("auto-approve confirms new requests immediately", async () => {
+    const on = await request(app)
+      .patch("/api/barber/auto-approve")
+      .set(auth(barberBToken))
+      .send({ enabled: true });
+    expect(on.status).toBe(200);
+    expect(on.body.autoApprove).toBe(true);
+
+    const cust = await newUser("+9647508009010");
+    const booking = await request(app)
+      .post("/api/reservations")
+      .set(auth(cust))
+      .send({ shopId, serviceId, date, startMinute: 660, barberId: barberBId });
+    expect(booking.status).toBe(201);
+    expect(booking.body.reservation.status).toBe("CONFIRMED");
+
+    await request(app)
+      .patch("/api/barber/auto-approve")
+      .set(auth(barberBToken))
+      .send({ enabled: false });
+  });
+
+  it("enabling auto-approve clears the pending queue and notifies", async () => {
+    await request(app).patch("/api/barber/auto-approve").set(auth(barberBToken)).send({ enabled: false });
+    const cust = await newUser("+9647508009011");
+    const booking = await request(app)
+      .post("/api/reservations")
+      .set(auth(cust))
+      .send({ shopId, serviceId, date, startMinute: 690, barberId: barberBId });
+    expect(booking.body.reservation.status).toBe("PENDING");
+
+    const on = await request(app)
+      .patch("/api/barber/auto-approve")
+      .set(auth(barberBToken))
+      .send({ enabled: true });
+    expect(on.body.approved).toBeGreaterThanOrEqual(1);
+
+    const up = await request(app)
+      .get("/api/reservations/mine")
+      .query({ scope: "upcoming" })
+      .set(auth(cust));
+    const mine = up.body.reservations.find(
+      (r: { id: string }) => r.id === booking.body.reservation.id,
+    );
+    expect(mine.status).toBe("CONFIRMED");
+    const notifs = await request(app).get("/api/notifications").set(auth(cust));
+    expect(notifs.body.notifications[0].type).toBe("BOOKING_ACCEPTED");
+
+    await request(app).patch("/api/barber/auto-approve").set(auth(barberBToken)).send({ enabled: false });
+  });
+
+  it("today returns the barber's confirmed appointments for today", async () => {
+    const cust = await prisma.user.findFirst({ where: { phone: "+9647508000001" } });
+    await prisma.reservation.create({
+      data: {
+        userId: cust!.id,
+        shopId,
+        serviceId,
+        barberId: barberAId,
+        price: 12_000,
+        startsAt: new Date(),
+        endsAt: new Date(Date.now() + 30 * 60_000),
+        status: "CONFIRMED",
+      },
+    });
+    const res = await request(app).get("/api/barber/today").set(auth(barberAToken));
+    expect(res.status).toBe(200);
+    expect(res.body.appointments.length).toBeGreaterThanOrEqual(1);
+    expect(res.body.appointments[0].done).toBe(false);
+  });
+
   it("rejects deciding an already-handled request", async () => {
     const cust = await newUser("+9647508009007");
     const booking = await request(app)
