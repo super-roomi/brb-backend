@@ -5,6 +5,7 @@ import { ApiError } from "../lib/errors.js";
 import { requireUser } from "../middleware/auth.js";
 import { validate, parsed } from "../middleware/validate.js";
 import { localDayRangeUtc } from "../lib/time.js";
+import { parseLang, localize } from "../lib/localize.js";
 
 export const barberRouter = Router();
 barberRouter.use(requireUser);
@@ -17,7 +18,7 @@ async function barberForRequest(userId: string) {
   if (!user) throw ApiError.unauthorized();
   return prisma.barber.findUnique({
     where: { phone: user.phone },
-    include: { shop: { select: { id: true, name: true } } },
+    include: { shop: { select: { id: true, name: true, nameAr: true, nameCkb: true } } },
   });
 }
 
@@ -29,12 +30,16 @@ barberRouter.get("/me", async (req, res) => {
     res.json({ isBarber: false });
     return;
   }
+  const lang = parseLang(req.query.lang);
   res.json({
     isBarber: true,
     barber: {
       id: barber.id,
-      name: barber.name,
-      shop: barber.shop,
+      name: localize(lang, barber.name, barber.nameAr, barber.nameCkb),
+      shop: {
+        id: barber.shop.id,
+        name: localize(lang, barber.shop.name, barber.shop.nameAr, barber.shop.nameCkb),
+      },
       autoApprove: barber.autoApprove,
     },
   });
@@ -117,7 +122,7 @@ barberRouter.get("/stats", async (req, res) => {
     prisma.reservation.findMany({
       where: { barberId: barber.id },
       include: {
-        service: { select: { name: true } },
+        service: { select: { name: true, nameAr: true, nameCkb: true } },
         user: { select: { name: true } },
       },
       orderBy: { startsAt: "desc" },
@@ -125,8 +130,16 @@ barberRouter.get("/stats", async (req, res) => {
     }),
   ]);
 
+  const lang = parseLang(req.query.lang);
   res.json({
-    barber: { id: barber.id, name: barber.name, shop: barber.shop },
+    barber: {
+      id: barber.id,
+      name: localize(lang, barber.name, barber.nameAr, barber.nameCkb),
+      shop: {
+        id: barber.shop.id,
+        name: localize(lang, barber.shop.name, barber.shop.nameAr, barber.shop.nameCkb),
+      },
+    },
     stats: {
       totalCuts: completedAgg._count,
       totalEarnings: completedAgg._sum.price ?? 0,
@@ -135,7 +148,7 @@ barberRouter.get("/stats", async (req, res) => {
     },
     recent: recent.map((r) => ({
       id: r.id,
-      serviceName: r.service.name,
+      serviceName: localize(lang, r.service.name, r.service.nameAr, r.service.nameCkb),
       customerName: r.user.name ?? "Customer",
       price: r.price,
       startsAt: r.startsAt.toISOString(),
@@ -165,17 +178,18 @@ barberRouter.get("/today", async (req, res) => {
       startsAt: { gte: dayStart, lt: dayEnd },
     },
     include: {
-      service: { select: { name: true, durationMin: true } },
+      service: { select: { name: true, nameAr: true, nameCkb: true, durationMin: true } },
       user: { select: { name: true, phone: true } },
     },
     orderBy: { startsAt: "asc" },
   });
 
+  const lang = parseLang(req.query.lang);
   res.json({
     utcOffsetMinutes: offset,
     appointments: appts.map((r) => ({
       id: r.id,
-      serviceName: r.service.name,
+      serviceName: localize(lang, r.service.name, r.service.nameAr, r.service.nameCkb),
       durationMin: r.service.durationMin,
       customerName: r.user.name ?? r.user.phone,
       price: r.price,
@@ -193,17 +207,18 @@ barberRouter.get("/requests", async (req, res) => {
   const requests = await prisma.reservation.findMany({
     where: { barberId: barber.id, status: "PENDING", endsAt: { gte: new Date() } },
     include: {
-      service: { select: { name: true, durationMin: true } },
+      service: { select: { name: true, nameAr: true, nameCkb: true, durationMin: true } },
       user: { select: { name: true, phone: true } },
       shop: { select: { utcOffsetMinutes: true } },
     },
     orderBy: { startsAt: "asc" },
   });
 
+  const lang = parseLang(req.query.lang);
   res.json({
     requests: requests.map((r) => ({
       id: r.id,
-      serviceName: r.service.name,
+      serviceName: localize(lang, r.service.name, r.service.nameAr, r.service.nameCkb),
       durationMin: r.service.durationMin,
       customerName: r.user.name ?? r.user.phone,
       price: r.price,

@@ -469,6 +469,28 @@ describe("admin", () => {
   });
 });
 
+describe("content localization", () => {
+  it("serves per-language names, falling back to base when a translation is missing", async () => {
+    // Add an Arabic name to the test shop; leave Kurdish unset.
+    const patch = await request(app)
+      .patch(`/api/admin/shops/${shopId}`)
+      .set(auth(adminToken))
+      .send({ nameAr: "صالون الاختبار" });
+    expect(patch.status).toBe(200);
+
+    const ar = await request(app).get(`/api/shops/${shopId}`).query({ lang: "ar" });
+    expect(ar.body.shop.name).toBe("صالون الاختبار");
+
+    // No Kurdish translation set → falls back to the base (English) name.
+    const ckb = await request(app).get(`/api/shops/${shopId}`).query({ lang: "ckb" });
+    expect(ckb.body.shop.name).toBe("Testable Cuts");
+
+    // No/unknown lang → base name.
+    const en = await request(app).get(`/api/shops/${shopId}`);
+    expect(en.body.shop.name).toBe("Testable Cuts");
+  });
+});
+
 function auth(token: string) {
   return { Authorization: `Bearer ${token}` };
 }

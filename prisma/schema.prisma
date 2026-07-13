@@ -66,8 +66,14 @@ model RefreshToken {
 
 model Barbershop {
   id               String        @id @default(cuid())
+  // Base (English) name/description; Ar/Ckb are optional translations shown in
+  // the app when that language is selected, else the base is used as fallback.
   name             String
+  nameAr           String?
+  nameCkb          String?
   description      String
+  descriptionAr    String?
+  descriptionCkb   String?
   address          String
   phone            String
   imageUrl         String?
@@ -106,6 +112,8 @@ model Service {
   shopId       String
   shop         Barbershop    @relation(fields: [shopId], references: [id], onDelete: Cascade)
   name         String
+  nameAr       String?
+  nameCkb      String?
   // Duration in minutes; price as integer in smallest currency unit (IQD has none).
   durationMin  Int
   price        Int
@@ -132,6 +140,8 @@ model Barber {
   shopId       String
   shop         Barbershop    @relation(fields: [shopId], references: [id], onDelete: Cascade)
   name         String
+  nameAr       String?
+  nameCkb      String?
   // E.164, unique across all barbers. A barber logs into the mobile app with
   // this number (same phone+OTP flow as customers) to see their own stats.
   phone        String        @unique

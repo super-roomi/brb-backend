@@ -6,6 +6,7 @@ import { validate, parsed } from "../middleware/validate.js";
 import { computeFreeSlots } from "../services/availability.js";
 import { isShopLive, liveShopWhere } from "../services/booking.js";
 import { isValidDateString } from "../lib/time.js";
+import { parseLang, localize } from "../lib/localize.js";
 
 export const catalogRouter = Router();
 
@@ -26,6 +27,7 @@ const listSchema = z.object({
 
 catalogRouter.get("/shops", validate(listSchema, "query"), async (req, res) => {
   const q = parsed<z.infer<typeof listSchema>>(req);
+  const lang = parseLang(req.query.lang);
   const where = {
     ...liveShopWhere(),
     ...(q.cityId ? { cityId: q.cityId } : {}),
@@ -56,8 +58,8 @@ catalogRouter.get("/shops", validate(listSchema, "query"), async (req, res) => {
 
   const items = shops.map((s) => ({
     id: s.id,
-    name: s.name,
-    description: s.description,
+    name: localize(lang, s.name, s.nameAr, s.nameCkb),
+    description: localize(lang, s.description, s.descriptionAr, s.descriptionCkb),
     address: s.address,
     imageUrl: s.imageUrl,
     city: s.city,
@@ -84,11 +86,12 @@ catalogRouter.get("/shops/:id", async (req, res) => {
   });
   if (!shop || !isShopLive(shop)) throw ApiError.notFound("Barbershop not found");
 
+  const lang = parseLang(req.query.lang);
   res.json({
     shop: {
       id: shop.id,
-      name: shop.name,
-      description: shop.description,
+      name: localize(lang, shop.name, shop.nameAr, shop.nameCkb),
+      description: localize(lang, shop.description, shop.descriptionAr, shop.descriptionCkb),
       address: shop.address,
       phone: shop.phone,
       imageUrl: shop.imageUrl,
@@ -108,11 +111,14 @@ catalogRouter.get("/shops/:id", async (req, res) => {
       },
       services: shop.services.map((s) => ({
         id: s.id,
-        name: s.name,
+        name: localize(lang, s.name, s.nameAr, s.nameCkb),
         durationMin: s.durationMin,
         price: s.price,
       })),
-      barbers: shop.barbers.map((b) => ({ id: b.id, name: b.name })),
+      barbers: shop.barbers.map((b) => ({
+        id: b.id,
+        name: localize(lang, b.name, b.nameAr, b.nameCkb),
+      })),
       openingHours: shop.openingHours.map((h) => ({
         weekday: h.weekday,
         openMinute: h.openMinute,

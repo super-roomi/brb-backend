@@ -86,9 +86,16 @@ const hoursSchema = z
     "Duplicate weekday",
   );
 
+// Optional Ar/Ckb translations for a short content field. "" is coerced to
+// null (see emptyToNull) so a cleared field is stored as absent.
+const trShort = z.string().trim().max(80).nullable().optional();
+const trLong = z.string().trim().max(2000).nullable().optional();
+
 const serviceSchema = z.object({
   id: z.string().optional(), // present = update existing
   name: z.string().trim().min(2).max(80),
+  nameAr: trShort,
+  nameCkb: trShort,
   durationMin: z.number().int().min(5).max(480),
   price: z.number().int().min(0),
   isActive: z.boolean().default(true),
@@ -97,6 +104,8 @@ const serviceSchema = z.object({
 const barberSchema = z.object({
   id: z.string().optional(), // present = update existing
   name: z.string().trim().min(2).max(60),
+  nameAr: trShort,
+  nameCkb: trShort,
   // Normalize to canonical E.164 at the boundary. A barber logs into the mobile
   // app with this number, and the barber-identity lookup is exact string
   // equality against the User's (already-normalized) phone — so an un-normalized
@@ -128,7 +137,11 @@ const socialUrl = z
 
 const shopBase = z.object({
   name: z.string().trim().min(2).max(80),
+  nameAr: trShort,
+  nameCkb: trShort,
   description: z.string().trim().min(10).max(2000),
+  descriptionAr: trLong,
+  descriptionCkb: trLong,
   address: z.string().trim().min(5).max(200),
   phone: z.string().trim().min(8).max(20),
   imageUrl: z.string().url().max(500).nullable().optional(),
@@ -209,7 +222,11 @@ adminRouter.post("/shops", validate(shopBase), async (req, res) => {
     .create({
       data: {
         name: body.name,
+        nameAr: emptyToNull(body.nameAr) ?? null,
+        nameCkb: emptyToNull(body.nameCkb) ?? null,
         description: body.description,
+        descriptionAr: emptyToNull(body.descriptionAr) ?? null,
+        descriptionCkb: emptyToNull(body.descriptionCkb) ?? null,
         address: body.address,
         phone: body.phone,
         imageUrl: body.imageUrl ?? null,
@@ -226,6 +243,8 @@ adminRouter.post("/shops", validate(shopBase), async (req, res) => {
         services: {
           create: body.services.map((s) => ({
             name: s.name,
+            nameAr: emptyToNull(s.nameAr) ?? null,
+            nameCkb: emptyToNull(s.nameCkb) ?? null,
             durationMin: s.durationMin,
             price: s.price,
             isActive: s.isActive,
@@ -235,6 +254,8 @@ adminRouter.post("/shops", validate(shopBase), async (req, res) => {
         barbers: {
           create: (body.barbers ?? []).map((b) => ({
             name: b.name,
+            nameAr: emptyToNull(b.nameAr) ?? null,
+            nameCkb: emptyToNull(b.nameCkb) ?? null,
             phone: b.phone,
             isActive: b.isActive,
           })),
@@ -294,7 +315,11 @@ adminRouter.patch("/shops/:id", validate(shopBase.partial()), async (req, res) =
       where: { id: existing.id },
       data: {
         name: body.name,
+        nameAr: emptyToNull(body.nameAr),
+        nameCkb: emptyToNull(body.nameCkb),
         description: body.description,
+        descriptionAr: emptyToNull(body.descriptionAr),
+        descriptionCkb: emptyToNull(body.descriptionCkb),
         address: body.address,
         phone: body.phone,
         imageUrl: body.imageUrl,
@@ -329,13 +354,22 @@ adminRouter.patch("/shops/:id", validate(shopBase.partial()), async (req, res) =
           // service by id. updateMany (not update) lets us match on both.
           await tx.service.updateMany({
             where: { id: s.id, shopId: existing.id },
-            data: { name: s.name, durationMin: s.durationMin, price: s.price, isActive: s.isActive },
+            data: {
+              name: s.name,
+              nameAr: emptyToNull(s.nameAr),
+              nameCkb: emptyToNull(s.nameCkb),
+              durationMin: s.durationMin,
+              price: s.price,
+              isActive: s.isActive,
+            },
           });
         } else {
           await tx.service.create({
             data: {
               shopId: existing.id,
               name: s.name,
+              nameAr: emptyToNull(s.nameAr) ?? null,
+              nameCkb: emptyToNull(s.nameCkb) ?? null,
               durationMin: s.durationMin,
               price: s.price,
               isActive: s.isActive,
@@ -357,11 +391,24 @@ adminRouter.patch("/shops/:id", validate(shopBase.partial()), async (req, res) =
           // Scope by shopId (see services above): no cross-shop id edits.
           await tx.barber.updateMany({
             where: { id: b.id, shopId: existing.id },
-            data: { name: b.name, phone: b.phone, isActive: b.isActive },
+            data: {
+              name: b.name,
+              nameAr: emptyToNull(b.nameAr),
+              nameCkb: emptyToNull(b.nameCkb),
+              phone: b.phone,
+              isActive: b.isActive,
+            },
           });
         } else {
           await tx.barber.create({
-            data: { shopId: existing.id, name: b.name, phone: b.phone, isActive: b.isActive },
+            data: {
+              shopId: existing.id,
+              name: b.name,
+              nameAr: emptyToNull(b.nameAr) ?? null,
+              nameCkb: emptyToNull(b.nameCkb) ?? null,
+              phone: b.phone,
+              isActive: b.isActive,
+            },
           });
         }
       }

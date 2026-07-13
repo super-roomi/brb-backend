@@ -255,9 +255,16 @@ export async function cancelReservation(userId: string, reservationId: string) {
 }
 
 export const reservationInclude = {
-  shop: { select: { id: true, name: true, address: true, imageUrl: true, utcOffsetMinutes: true } },
-  service: { select: { id: true, name: true, durationMin: true, price: true } },
-  barber: { select: { id: true, name: true } },
+  shop: {
+    select: {
+      id: true, name: true, nameAr: true, nameCkb: true,
+      address: true, imageUrl: true, utcOffsetMinutes: true,
+    },
+  },
+  service: {
+    select: { id: true, name: true, nameAr: true, nameCkb: true, durationMin: true, price: true },
+  },
+  barber: { select: { id: true, name: true, nameAr: true, nameCkb: true } },
 } as const;
 
 // A shop is live in the app when the admin made it visible AND it has an
