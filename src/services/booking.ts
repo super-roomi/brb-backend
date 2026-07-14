@@ -102,6 +102,7 @@ export async function createReservation(input: {
         useBarbers,
         eligible,
         chairCount: shop.chairCount,
+        bufferMin: shop.bufferMin,
         servicePrice: service.price,
         specificBarber: barberId,
       });
@@ -126,6 +127,7 @@ function runBookingTx(args: {
   useBarbers: boolean;
   eligible: { id: string; autoApprove: boolean }[];
   chairCount: number;
+  bufferMin: number;
   servicePrice: number;
   specificBarber?: string;
 }) {
@@ -138,9 +140,11 @@ function runBookingTx(args: {
     useBarbers,
     eligible,
     chairCount,
+    bufferMin,
     servicePrice,
     specificBarber,
   } = args;
+  const bufMs = bufferMin * 60_000;
 
   return prisma.$transaction(
     async (tx) => {
@@ -160,12 +164,17 @@ function runBookingTx(args: {
         );
       }
 
+      // Buffered overlap: a reservation conflicts when the gap between it and
+      // the new booking would be smaller than the shop's grace period
+      // (equivalent to inflating both intervals' ends by bufferMin). The column
+      // can't be shifted in SQL through Prisma, so the query bounds move by the
+      // buffer instead — same predicate.
       const overlapping = await tx.reservation.findMany({
         where: {
           shopId,
           status: { in: HOLDING_STATUSES },
-          startsAt: { lt: endsAt },
-          endsAt: { gt: startsAt },
+          startsAt: { lt: new Date(endsAt.getTime() + bufMs) },
+          endsAt: { gt: new Date(startsAt.getTime() - bufMs) },
         },
         select: { barberId: true },
       });

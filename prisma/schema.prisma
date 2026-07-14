@@ -97,6 +97,10 @@ model Barbershop {
   city             City          @relation(fields: [cityId], references: [id])
   // Number of chairs = how many reservations can overlap at one time.
   chairCount       Int           @default(1)
+  // Grace period in minutes enforced between consecutive bookings (per barber,
+  // or per chair for shops without barbers): after a booking ends, the next one
+  // can't start until bufferMin minutes later. 0 = back-to-back allowed.
+  bufferMin        Int           @default(0)
   // Wall-clock offset for the shop's locale (Iraq: UTC+3, no DST).
   utcOffsetMinutes Int           @default(180)
   isVisible        Boolean       @default(false)

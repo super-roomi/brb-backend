@@ -41,6 +41,12 @@ export async function computeFreeSlots(
   const hours = shop.openingHours.find((h) => h.weekday === weekdayOfLocalDate(date));
   if (!hours) return []; // closed that day
 
+  // Grace period between consecutive bookings: treat every booking as
+  // occupying [startsAt, endsAt + buffer) in both directions, so a slot is
+  // rejected when it would start too soon after an existing booking OR end too
+  // close before one. bufferMin = 0 keeps the old back-to-back behaviour.
+  const bufMs = shop.bufferMin * 60_000;
+
   const dayStart = localDateToUtc(date, 0, shop.utcOffsetMinutes);
   const dayEnd = localDateToUtc(date, 24 * 60, shop.utcOffsetMinutes);
   const existing = await prisma.reservation.findMany({
@@ -48,8 +54,10 @@ export async function computeFreeSlots(
       shopId,
       // Pending requests hold the slot too, so they can't be double-booked.
       status: { in: ["PENDING", "CONFIRMED"] },
-      startsAt: { lt: dayEnd },
-      endsAt: { gt: dayStart },
+      // Widened by the buffer so a booking just outside the day window can
+      // still block the first/last slots of this day.
+      startsAt: { lt: new Date(dayEnd.getTime() + bufMs) },
+      endsAt: { gt: new Date(dayStart.getTime() - bufMs) },
     },
     select: { startsAt: true, endsAt: true, barberId: true },
   });
@@ -57,6 +65,11 @@ export async function computeFreeSlots(
   const earliest = Date.now() + BOOKING_LEAD_MIN * 60_000;
   const useBarbers = eligible.length > 0;
   const slots: Slot[] = [];
+
+  // Conflict when the gap between the two bookings would be < bufferMin.
+  const conflicts = (r: { startsAt: Date; endsAt: Date }, start: Date, end: Date) =>
+    r.startsAt.getTime() < end.getTime() + bufMs &&
+    r.endsAt.getTime() + bufMs > start.getTime();
 
   for (
     let m = hours.openMinute;
@@ -69,16 +82,11 @@ export async function computeFreeSlots(
 
     if (useBarbers) {
       const someoneFree = eligible.some(
-        (b) =>
-          !existing.some(
-            (r) => r.barberId === b.id && r.startsAt < end && r.endsAt > start,
-          ),
+        (b) => !existing.some((r) => r.barberId === b.id && conflicts(r, start, end)),
       );
       if (someoneFree) slots.push({ startMinute: m, startsAt: start.toISOString() });
     } else {
-      const overlapping = existing.filter(
-        (r) => r.startsAt < end && r.endsAt > start,
-      ).length;
+      const overlapping = existing.filter((r) => conflicts(r, start, end)).length;
       if (overlapping < shop.chairCount) {
         slots.push({ startMinute: m, startsAt: start.toISOString() });
       }

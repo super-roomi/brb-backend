@@ -581,6 +581,84 @@ describe("barber of the week", () => {
   });
 });
 
+describe("booking grace period (bufferMin)", () => {
+  const date = openDate();
+  let bufShopId: string;
+  let bufServiceId: string;
+
+  it("admin sets a 20-minute grace period on a shop", async () => {
+    const created = await request(app)
+      .post("/api/admin/shops")
+      .set(auth(adminToken))
+      .send({
+        name: "Buffered Cuts",
+        description: "Shop with a grace period between bookings.",
+        address: "5 Buffer Street",
+        phone: "+9647500000055",
+        cityId,
+        chairCount: 1,
+        bufferMin: 20,
+        openingHours: Array.from({ length: 7 }, (_, weekday) => ({
+          weekday,
+          openMinute: 9 * 60,
+          closeMinute: 18 * 60,
+        })),
+        services: [{ name: "Cut", durationMin: 30, price: 15000 }],
+      });
+    expect(created.status).toBe(201);
+    bufShopId = created.body.shop.id;
+    await request(app)
+      .put(`/api/admin/shops/${bufShopId}/subscription`)
+      .set(auth(adminToken))
+      .send({ planId, months: 1 });
+    await request(app)
+      .patch(`/api/admin/shops/${bufShopId}/visibility`)
+      .set(auth(adminToken))
+      .send({ isVisible: true });
+    const detail = await request(app).get(`/api/shops/${bufShopId}`);
+    expect(detail.status).toBe(200);
+    bufServiceId = detail.body.shop.services[0].id;
+  });
+
+  it("blocks slots inside the grace window and frees the first one past it", async () => {
+    // First customer books 10:00–10:30. With a 20-min buffer the same chair is
+    // blocked until 10:50, so 10:30 and 10:45 must vanish; 11:00 stays.
+    const a = await newUserToken("+9647500020001");
+    const book = await request(app)
+      .post("/api/reservations")
+      .set(auth(a))
+      .send({ shopId: bufShopId, serviceId: bufServiceId, date, startMinute: 600 });
+    expect(book.status).toBe(201);
+
+    const avail = await request(app)
+      .get(`/api/shops/${bufShopId}/availability`)
+      .query({ date, serviceId: bufServiceId });
+    const minutes = avail.body.slots.map((s: { startMinute: number }) => s.startMinute);
+    expect(minutes).not.toContain(630); // 10:30 — back-to-back, no grace
+    expect(minutes).not.toContain(645); // 10:45 — still inside the 20-min grace
+    expect(minutes).toContain(660); // 11:00 — first slot ≥ 20 min after 10:30
+    // The grace also protects the booking's start: a 9:30–10:00 cut would leave
+    // zero rest before the 10:00 appointment, so 9:30 must be blocked too.
+    expect(minutes).not.toContain(570);
+
+    // Direct API attempt inside the grace window is rejected server-side.
+    const b = await newUserToken("+9647500020002");
+    const tooClose = await request(app)
+      .post("/api/reservations")
+      .set(auth(b))
+      .send({ shopId: bufShopId, serviceId: bufServiceId, date, startMinute: 630 });
+    expect(tooClose.status).toBe(409);
+    expect(tooClose.body.error.code).toBe("SLOT_TAKEN");
+
+    // …and the first slot past the grace period books fine.
+    const ok = await request(app)
+      .post("/api/reservations")
+      .set(auth(b))
+      .send({ shopId: bufShopId, serviceId: bufServiceId, date, startMinute: 660 });
+    expect(ok.status).toBe(201);
+  });
+});
+
 describe("device tokens (FCM)", () => {
   it("requires auth", async () => {
     const res = await request(app)
