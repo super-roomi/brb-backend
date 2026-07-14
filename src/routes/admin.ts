@@ -11,6 +11,7 @@ import { isShopLive } from "../services/booking.js";
 import { tryNormalizePhone } from "../lib/phone.js";
 import { adminLoginLimiter } from "../middleware/rateLimit.js";
 import { addMonths } from "../lib/time.js";
+import { sendPushToUsers } from "../lib/push.js";
 import { env } from "../env.js";
 
 export const adminRouter = Router();
@@ -585,6 +586,18 @@ adminRouter.post("/barber-of-week", validate(botwSchema), async (req, res) => {
         ]
       : []),
   ]);
+
+  // Real push to everyone (no-op if FCM unconfigured), on top of the feed rows.
+  if (users.length > 0) {
+    void sendPushToUsers(
+      users.map((u) => u.id),
+      {
+        title: "Barber of the Week",
+        body: "This week's top barbershops are in — see them at the top of the app.",
+        data: { type: "BARBER_OF_WEEK" },
+      },
+    );
+  }
 
   res.json({ ok: true, count: shopIds.length, notified: users.length });
 });

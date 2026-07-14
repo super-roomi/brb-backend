@@ -6,6 +6,7 @@ import { requireUser } from "../middleware/auth.js";
 import { validate, parsed } from "../middleware/validate.js";
 import { localDayRangeUtc } from "../lib/time.js";
 import { parseLang, localize } from "../lib/localize.js";
+import { sendPushToUser } from "../lib/push.js";
 
 export const barberRouter = Router();
 barberRouter.use(requireUser);
@@ -82,6 +83,14 @@ barberRouter.patch("/auto-approve", validate(autoApproveSchema), async (req, res
           })),
         }),
       ]);
+      // Real push per confirmed request (no-op if FCM unconfigured).
+      for (const r of pending) {
+        void sendPushToUser(r.userId, {
+          title: "Booking confirmed",
+          body: `${barber.name} confirmed your ${r.service.name} at ${r.shop.name}.`,
+          data: { type: "BOOKING_ACCEPTED", reservationId: r.id },
+        });
+      }
     }
     approved = pending.length;
   }
@@ -316,6 +325,10 @@ async function decideReservation(
 
   const accepted = action === "accept";
   const status = accepted ? "CONFIRMED" : "DECLINED";
+  const title = accepted ? "Booking confirmed" : "Booking declined";
+  const body = accepted
+    ? `${barber.name} confirmed your ${reservation.service.name} at ${reservation.shop.name}.`
+    : `${barber.name} could not take your ${reservation.service.name} at ${reservation.shop.name}. Please pick another time.`;
 
   // Compare-and-swap inside the transaction: the decision only lands if the
   // reservation is still PENDING. If the customer cancelled between our read
@@ -333,13 +346,21 @@ async function decideReservation(
       data: {
         userId: reservation.userId,
         type: accepted ? "BOOKING_ACCEPTED" : "BOOKING_DECLINED",
-        title: accepted ? "Booking confirmed" : "Booking declined",
-        body: accepted
-          ? `${barber.name} confirmed your ${reservation.service.name} at ${reservation.shop.name}.`
-          : `${barber.name} could not take your ${reservation.service.name} at ${reservation.shop.name}. Please pick another time.`,
+        title,
+        body,
         reservationId: reservation.id,
       },
     });
+  });
+
+  // Real push on top of the in-app record (no-op if FCM unconfigured).
+  void sendPushToUser(reservation.userId, {
+    title,
+    body,
+    data: {
+      type: accepted ? "BOOKING_ACCEPTED" : "BOOKING_DECLINED",
+      reservationId: reservation.id,
+    },
   });
 
   return { id: reservation.id, status };

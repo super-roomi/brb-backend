@@ -30,6 +30,22 @@ model User {
   reviews       Review[]
   refreshTokens RefreshToken[]
   notifications Notification[]
+  deviceTokens  DeviceToken[]
+}
+
+// FCM registration token for a user's device, used to deliver push
+// notifications. One row per device; the token is globally unique and
+// reassigned to the current user if it reappears under a new login.
+model DeviceToken {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String   @unique
+  platform  String   // 'android' | 'ios'
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
 }
 
 model AdminUser {

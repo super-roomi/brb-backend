@@ -581,6 +581,35 @@ describe("barber of the week", () => {
   });
 });
 
+describe("device tokens (FCM)", () => {
+  it("requires auth", async () => {
+    const res = await request(app)
+      .post("/api/notifications/device")
+      .send({ token: "x".repeat(20) });
+    expect(res.status).toBe(401);
+  });
+
+  it("registers (idempotently) and unregisters a device token", async () => {
+    const body = { token: "test-fcm-token-abc123", platform: "android" };
+    const reg = await request(app)
+      .post("/api/notifications/device")
+      .set(auth(userToken))
+      .send(body);
+    expect(reg.status).toBe(200);
+    // Re-registering the same token is an upsert (no duplicate / no error).
+    const reg2 = await request(app)
+      .post("/api/notifications/device")
+      .set(auth(userToken))
+      .send(body);
+    expect(reg2.status).toBe(200);
+    const un = await request(app)
+      .post("/api/notifications/device/unregister")
+      .set(auth(userToken))
+      .send({ token: body.token });
+    expect(un.status).toBe(200);
+  });
+});
+
 function auth(token: string) {
   return { Authorization: `Bearer ${token}` };
 }
