@@ -150,6 +150,9 @@ const shopBase = z.object({
   utcOffsetMinutes: z.number().int().min(-720).max(840).default(180),
   latitude: z.number().min(-90).max(90).nullable().optional(),
   longitude: z.number().min(-180).max(180).nullable().optional(),
+  locationLabel: trShort,
+  locationLabelAr: trShort,
+  locationLabelCkb: trShort,
   instagramUrl: socialUrl,
   facebookUrl: socialUrl,
   tiktokUrl: socialUrl,
@@ -235,6 +238,9 @@ adminRouter.post("/shops", validate(shopBase), async (req, res) => {
         utcOffsetMinutes: body.utcOffsetMinutes,
         latitude: body.latitude ?? null,
         longitude: body.longitude ?? null,
+        locationLabel: emptyToNull(body.locationLabel) ?? null,
+        locationLabelAr: emptyToNull(body.locationLabelAr) ?? null,
+        locationLabelCkb: emptyToNull(body.locationLabelCkb) ?? null,
         instagramUrl: emptyToNull(body.instagramUrl) ?? null,
         facebookUrl: emptyToNull(body.facebookUrl) ?? null,
         tiktokUrl: emptyToNull(body.tiktokUrl) ?? null,
@@ -328,6 +334,9 @@ adminRouter.patch("/shops/:id", validate(shopBase.partial()), async (req, res) =
         utcOffsetMinutes: body.utcOffsetMinutes,
         latitude: body.latitude,
         longitude: body.longitude,
+        locationLabel: emptyToNull(body.locationLabel),
+        locationLabelAr: emptyToNull(body.locationLabelAr),
+        locationLabelCkb: emptyToNull(body.locationLabelCkb),
         instagramUrl: emptyToNull(body.instagramUrl),
         facebookUrl: emptyToNull(body.facebookUrl),
         tiktokUrl: emptyToNull(body.tiktokUrl),
@@ -467,6 +476,117 @@ adminRouter.patch("/plans/:id", validate(planSchema.partial()), async (req, res)
     .catch(() => null);
   if (!plan) throw ApiError.notFound("Plan not found");
   res.json({ plan });
+});
+
+// Hard-delete a plan. Refused while any subscription (past or present)
+// references it — deactivate it instead to keep billing history intact.
+adminRouter.delete("/plans/:id", async (req, res) => {
+  const inUse = await prisma.subscription.count({ where: { planId: req.params.id } });
+  if (inUse > 0) {
+    throw ApiError.conflict(
+      "This plan is used by one or more shops. Deactivate it instead of deleting.",
+      "PLAN_IN_USE",
+    );
+  }
+  const deleted = await prisma.plan.delete({ where: { id: req.params.id } }).catch(() => null);
+  if (!deleted) throw ApiError.notFound("Plan not found");
+  res.json({ ok: true });
+});
+
+// ---- Barber of the Week ----
+
+// Eligible pool: shops live in the app AND on a featured-tier plan.
+function botwEligibleWhere(now: Date) {
+  return {
+    isVisible: true,
+    subscription: {
+      is: { status: "ACTIVE", currentPeriodEnd: { gt: now }, plan: { isFeaturedTier: true } },
+    },
+  } as const;
+}
+
+adminRouter.get("/barber-of-week", async (_req, res) => {
+  const now = new Date();
+  const eligible = await prisma.barbershop.findMany({
+    where: botwEligibleWhere(now),
+    include: {
+      city: { select: { name: true } },
+      subscription: { select: { plan: { select: { name: true, monthlyPrice: true } } } },
+    },
+    orderBy: [{ ratingAvg: "desc" }, { ratingCount: "desc" }],
+  });
+
+  const current = eligible
+    .filter((s) => s.botwRank != null)
+    .sort((a, b) => (a.botwRank! - b.botwRank!))
+    .map((s) => s.id);
+
+  res.json({
+    shops: eligible.map((s) => ({
+      id: s.id,
+      name: s.name,
+      city: s.city.name,
+      ratingAvg: s.ratingAvg,
+      ratingCount: s.ratingCount,
+      planName: s.subscription?.plan.name ?? null,
+      monthlyPrice: s.subscription?.plan.monthlyPrice ?? null,
+    })),
+    current,
+    // Suggested pick: top 3 eligible by rating (admin can adjust before confirm).
+    suggested: eligible.slice(0, 3).map((s) => s.id),
+  });
+});
+
+const botwSchema = z.object({ shopIds: z.array(z.string()).max(3) });
+
+adminRouter.post("/barber-of-week", validate(botwSchema), async (req, res) => {
+  const { shopIds } = parsed<z.infer<typeof botwSchema>>(req);
+  if (new Set(shopIds).size !== shopIds.length) {
+    throw ApiError.badRequest("Duplicate shop in selection", "BOTW_DUPLICATE");
+  }
+  const now = new Date();
+
+  if (shopIds.length > 0) {
+    const okCount = await prisma.barbershop.count({
+      where: { id: { in: shopIds }, ...botwEligibleWhere(now) },
+    });
+    if (okCount !== shopIds.length) {
+      throw ApiError.badRequest(
+        "Every selection must be a live, featured-tier shop.",
+        "BOTW_INELIGIBLE",
+      );
+    }
+  }
+
+  const users = shopIds.length > 0 ? await prisma.user.findMany({ select: { id: true } }) : [];
+
+  await prisma.$transaction([
+    // Clear the previous week's picks.
+    prisma.barbershop.updateMany({
+      where: { botwRank: { not: null } },
+      data: { botwRank: null, botwSelectedAt: null },
+    }),
+    // Set the new ranked picks.
+    ...shopIds.map((id, i) =>
+      prisma.barbershop.update({ where: { id }, data: { botwRank: i + 1, botwSelectedAt: now } }),
+    ),
+    // In-app feed notification for every user (real APNs/FCM push would layer
+    // onto these same records).
+    ...(users.length > 0
+      ? [
+          prisma.notification.createMany({
+            data: users.map((u) => ({
+              userId: u.id,
+              type: "BARBER_OF_WEEK",
+              title: "Barber of the Week",
+              body: "This week's top barbershops are in — see them at the top of the app.",
+            })),
+          }),
+        ]
+      : []),
+  ]);
+
+  res.json({ ok: true, count: shopIds.length, notified: users.length });
 });
 
 // ---- Subscriptions ----

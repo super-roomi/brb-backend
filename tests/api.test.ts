@@ -491,6 +491,96 @@ describe("content localization", () => {
   });
 });
 
+describe("plans: deletion", () => {
+  it("refuses to delete a plan that is in use", async () => {
+    const res = await request(app)
+      .delete(`/api/admin/plans/${planId}`)
+      .set(auth(adminToken));
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("PLAN_IN_USE");
+  });
+
+  it("deletes an unused plan", async () => {
+    const created = await request(app)
+      .post("/api/admin/plans")
+      .set(auth(adminToken))
+      .send({ name: "Disposable", monthlyPrice: 1000 });
+    expect(created.status).toBe(201);
+    const del = await request(app)
+      .delete(`/api/admin/plans/${created.body.plan.id}`)
+      .set(auth(adminToken));
+    expect(del.status).toBe(200);
+  });
+});
+
+describe("barber of the week", () => {
+  it("rejects non-featured-tier shops", async () => {
+    // The test shop's plan is not a featured tier → not eligible.
+    const res = await request(app)
+      .post("/api/admin/barber-of-week")
+      .set(auth(adminToken))
+      .send({ shopIds: [shopId] });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("BOTW_INELIGIBLE");
+  });
+
+  it("clears the selection with an empty list", async () => {
+    const res = await request(app)
+      .post("/api/admin/barber-of-week")
+      .set(auth(adminToken))
+      .send({ shopIds: [] });
+    expect(res.status).toBe(200);
+    const feed = await request(app).get("/api/shops/of-the-week");
+    expect(feed.status).toBe(200);
+    expect(feed.body.shops).toEqual([]);
+  });
+
+  it("features a live featured-tier shop end-to-end and notifies users", async () => {
+    const plan = await request(app)
+      .post("/api/admin/plans")
+      .set(auth(adminToken))
+      .send({ name: "Master", monthlyPrice: 25000, isFeaturedTier: true });
+    const created = await request(app)
+      .post("/api/admin/shops")
+      .set(auth(adminToken))
+      .send({
+        name: "Master Cuts",
+        description: "Featured-tier shop used for Barber of the Week.",
+        address: "9 Feature Street",
+        phone: "+9647500000009",
+        cityId,
+        chairCount: 1,
+        openingHours: [{ weekday: 1, openMinute: 540, closeMinute: 1080 }],
+        services: [{ name: "Cut", durationMin: 30, price: 25000 }],
+      });
+    const newShopId = created.body.shop.id;
+    await request(app)
+      .put(`/api/admin/shops/${newShopId}/subscription`)
+      .set(auth(adminToken))
+      .send({ planId: plan.body.plan.id, months: 1 });
+    await request(app)
+      .patch(`/api/admin/shops/${newShopId}/visibility`)
+      .set(auth(adminToken))
+      .send({ isVisible: true });
+
+    const conf = await request(app)
+      .post("/api/admin/barber-of-week")
+      .set(auth(adminToken))
+      .send({ shopIds: [newShopId] });
+    expect(conf.status).toBe(200);
+    expect(conf.body.count).toBe(1);
+    expect(conf.body.notified).toBeGreaterThan(0);
+
+    const feed = await request(app).get("/api/shops/of-the-week");
+    expect(feed.body.shops.map((s: { id: string }) => s.id)).toEqual([newShopId]);
+
+    const notifs = await request(app).get("/api/notifications").set(auth(userToken));
+    expect(
+      notifs.body.notifications.some((n: { type: string }) => n.type === "BARBER_OF_WEEK"),
+    ).toBe(true);
+  });
+});
+
 function auth(token: string) {
   return { Authorization: `Bearer ${token}` };
 }

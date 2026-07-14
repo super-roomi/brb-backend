@@ -73,6 +73,33 @@ catalogRouter.get("/shops", validate(listSchema, "query"), async (req, res) => {
   res.json({ shops: items, page: q.page, pageSize: q.pageSize, total });
 });
 
+// Barber of the Week: up to 3 curated shops shown atop the app home, below the
+// search. Registered before "/shops/:id" so it isn't matched as an id.
+catalogRouter.get("/shops/of-the-week", async (req, res) => {
+  const lang = parseLang(req.query.lang);
+  // Auto-expire a stale selection after a week (in case the admin didn't reset).
+  const cutoff = new Date(Date.now() - 7 * 86_400_000);
+  const shops = await prisma.barbershop.findMany({
+    where: { botwRank: { not: null }, botwSelectedAt: { gte: cutoff }, ...liveShopWhere() },
+    include: { city: { select: { id: true, name: true } } },
+    orderBy: { botwRank: "asc" },
+    take: 3,
+  });
+  res.json({
+    shops: shops.map((s) => ({
+      id: s.id,
+      name: localize(lang, s.name, s.nameAr, s.nameCkb),
+      description: localize(lang, s.description, s.descriptionAr, s.descriptionCkb),
+      address: s.address,
+      imageUrl: s.imageUrl,
+      city: s.city,
+      ratingAvg: s.ratingAvg,
+      ratingCount: s.ratingCount,
+      isFeatured: true,
+    })),
+  });
+});
+
 catalogRouter.get("/shops/:id", async (req, res) => {
   const shop = await prisma.barbershop.findUnique({
     where: { id: req.params.id },
@@ -100,6 +127,8 @@ catalogRouter.get("/shops/:id", async (req, res) => {
       utcOffsetMinutes: shop.utcOffsetMinutes,
       latitude: shop.latitude,
       longitude: shop.longitude,
+      locationLabel:
+        localize(lang, shop.locationLabel ?? "", shop.locationLabelAr, shop.locationLabelCkb) || null,
       ratingAvg: shop.ratingAvg,
       ratingCount: shop.ratingCount,
       isFeatured: shop.subscription?.plan.isFeaturedTier ?? false,
