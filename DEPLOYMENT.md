@@ -19,8 +19,8 @@ Set these in the Railway service **Variables** tab before deploying this change.
 | `NODE_ENV` | **yes → `production`** | Turns on the security hardening below. Without it the server runs in dev mode (insecure JWT fallback). |
 | `JWT_ACCESS_SECRET` | **yes** | A strong random value: `openssl rand -hex 32`. **The server now refuses to boot in production if this is missing or still the dev placeholder** — set it or the deploy will crash-loop. |
 | `CORS_ORIGINS` | yes | Comma-separated; must include the deployed admin panel's origin. |
-| `SMS_PROVIDER` | recommended | `twilio` for real SMS. If left as `console`, OTP codes are printed to the logs (fine for staging, not for real users). |
-| `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_FROM_NUMBER` | if `SMS_PROVIDER=twilio` | The server throws on boot if `SMS_PROVIDER=twilio` and any are missing. |
+| `GOOGLE_CLIENT_ID` | required for login | Comma-separated Google OAuth client id(s) accepted as ID-token audience (at minimum the WEB client id the app uses as `serverClientId`). While it is the checked-in placeholder, `/api/auth/google` returns 503 `GOOGLE_NOT_CONFIGURED`. |
+| `ENABLE_TEST_LOGIN` | optional | `true` exposes `POST /api/auth/test-login` on a production-mode deploy (staging only — it is password-less). Outside production it is always on. |
 | `ADMIN_ACCESS_TOKEN_TTL` | optional | Defaults to `8h`. |
 | `LOG_LEVEL` | optional | Defaults to `info`. Logs are JSON on stdout — Railway captures them. |
 

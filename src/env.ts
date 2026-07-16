@@ -22,6 +22,18 @@ function accessSecret(): string {
   return v ?? DEV_ACCESS_SECRET;
 }
 
+// Placeholder until real Google Cloud Console credentials exist. Login via
+// Google fails against this value; the test-login endpoint covers development.
+const GOOGLE_CLIENT_ID_PLACEHOLDER =
+  "YOUR_WEB_CLIENT_ID.apps.googleusercontent.com";
+
+// Accepted `aud` values for Google ID tokens. Comma-separated so the web,
+// Android and iOS OAuth client ids can all be listed once they exist.
+const googleClientIds = (process.env.GOOGLE_CLIENT_ID ?? GOOGLE_CLIENT_ID_PLACEHOLDER)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 export const env = {
   nodeEnv: process.env.NODE_ENV ?? "development",
   port: Number(process.env.PORT ?? 4000),
@@ -31,7 +43,11 @@ export const env = {
   // mid-edit. An internal panel tolerates a longer-lived token.
   adminAccessTtl: process.env.ADMIN_ACCESS_TOKEN_TTL ?? "8h",
   refreshTtlDays: Number(process.env.REFRESH_TOKEN_TTL_DAYS ?? 30),
-  smsProvider: process.env.SMS_PROVIDER ?? "console",
+  googleClientIds,
+  googleConfigured: !googleClientIds.includes(GOOGLE_CLIENT_ID_PLACEHOLDER),
+  // Password-less developer login. Never enabled in production unless the
+  // operator opts in explicitly (e.g. a staging deploy behind other controls).
+  testLoginEnabled: !isProd || process.env.ENABLE_TEST_LOGIN === "true",
   corsOrigins: (process.env.CORS_ORIGINS ?? "http://localhost:5173")
     .split(",")
     .map((s) => s.trim())

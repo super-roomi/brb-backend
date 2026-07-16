@@ -8,7 +8,6 @@ import { signAccessToken } from "../lib/jwt.js";
 import { requireAdmin } from "../middleware/auth.js";
 import { validate, parsed } from "../middleware/validate.js";
 import { isShopLive } from "../services/booking.js";
-import { tryNormalizePhone } from "../lib/phone.js";
 import { adminLoginLimiter } from "../middleware/rateLimit.js";
 import { addMonths } from "../lib/time.js";
 import { sendPushToUsers } from "../lib/push.js";
@@ -107,26 +106,11 @@ const barberSchema = z.object({
   name: z.string().trim().min(2).max(60),
   nameAr: trShort,
   nameCkb: trShort,
-  // Normalize to canonical E.164 at the boundary. A barber logs into the mobile
-  // app with this number, and the barber-identity lookup is exact string
-  // equality against the User's (already-normalized) phone — so an un-normalized
-  // stored phone would silently lock the barber out of their dashboard.
-  phone: z
-    .string()
-    .trim()
-    .min(8)
-    .max(20)
-    .transform((v, ctx) => {
-      const normalized = tryNormalizePhone(v);
-      if (!normalized) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: "Phone must be in international format, e.g. +9647501234567",
-        });
-        return z.NEVER;
-      }
-      return normalized;
-    }),
+  // Lowercase at the boundary. A barber signs into the mobile app with this
+  // Google account, and the barber-identity lookup is exact string equality
+  // against the User's (already-lowercased) email — so a mixed-case stored
+  // email would silently lock the barber out of their dashboard.
+  email: z.string().trim().toLowerCase().email().max(120),
   isActive: z.boolean().default(true),
 });
 
@@ -222,7 +206,7 @@ adminRouter.post("/shops", validate(shopBase), async (req, res) => {
   const city = await prisma.city.findUnique({ where: { id: body.cityId } });
   if (!city) throw ApiError.badRequest("Unknown city", "UNKNOWN_CITY");
 
-  await assertBarberPhonesFree(body.barbers ?? []);
+  await assertBarberEmailsFree(body.barbers ?? []);
 
   const shop = await prisma.barbershop
     .create({
@@ -266,49 +250,49 @@ adminRouter.post("/shops", validate(shopBase), async (req, res) => {
             name: b.name,
             nameAr: emptyToNull(b.nameAr) ?? null,
             nameCkb: emptyToNull(b.nameCkb) ?? null,
-            phone: b.phone,
+            email: b.email,
             isActive: b.isActive,
           })),
         },
       },
     })
-    .catch(rethrowBarberPhoneConflict);
+    .catch(rethrowBarberEmailConflict);
   res.status(201).json({ shop: { id: shop.id } });
 });
 
 // The pre-check below narrows most conflicts to a friendly 409, but two admins
-// saving the same new phone concurrently can still slip past it and hit the DB
+// saving the same new email concurrently can still slip past it and hit the DB
 // unique constraint. Translate that P2002 into the same 409 instead of a 500.
-function rethrowBarberPhoneConflict(e: unknown): never {
+function rethrowBarberEmailConflict(e: unknown): never {
   if (
     e instanceof Prisma.PrismaClientKnownRequestError &&
     e.code === "P2002" &&
-    String(e.meta?.target ?? "").includes("phone")
+    String(e.meta?.target ?? "").includes("email")
   ) {
-    throw ApiError.conflict("That barber phone is already in use", "BARBER_PHONE_TAKEN");
+    throw ApiError.conflict("That barber email is already in use", "BARBER_EMAIL_TAKEN");
   }
   throw e;
 }
 
-// A barber phone must be unique across the whole platform (it is a login).
-async function assertBarberPhonesFree(
-  barbers: { id?: string; phone: string }[],
+// A barber email must be unique across the whole platform (it is a login).
+async function assertBarberEmailsFree(
+  barbers: { id?: string; email: string }[],
   shopId?: string,
 ) {
-  const phones = barbers.map((b) => b.phone);
-  if (new Set(phones).size !== phones.length) {
-    throw ApiError.badRequest("Duplicate barber phone in this shop", "DUP_BARBER_PHONE");
+  const emails = barbers.map((b) => b.email);
+  if (new Set(emails).size !== emails.length) {
+    throw ApiError.badRequest("Duplicate barber email in this shop", "DUP_BARBER_EMAIL");
   }
   const clashes = await prisma.barber.findMany({
-    where: { phone: { in: phones } },
+    where: { email: { in: emails } },
   });
   for (const clash of clashes) {
-    const submitted = barbers.find((b) => b.phone === clash.phone);
+    const submitted = barbers.find((b) => b.email === clash.email);
     // OK when it is the same barber being edited in the same shop.
     if (!(submitted?.id === clash.id && clash.shopId === shopId)) {
       throw ApiError.conflict(
-        `Phone ${clash.phone} already belongs to another barber`,
-        "BARBER_PHONE_TAKEN",
+        `Email ${clash.email} already belongs to another barber`,
+        "BARBER_EMAIL_TAKEN",
       );
     }
   }
@@ -318,7 +302,7 @@ adminRouter.patch("/shops/:id", validate(shopBase.partial()), async (req, res) =
   const body = parsed<z.infer<ReturnType<typeof shopBase.partial>>>(req);
   const existing = await prisma.barbershop.findUnique({ where: { id: req.params.id } });
   if (!existing) throw ApiError.notFound("Barbershop not found");
-  if (body.barbers) await assertBarberPhonesFree(body.barbers, existing.id);
+  if (body.barbers) await assertBarberEmailsFree(body.barbers, existing.id);
 
   await prisma.$transaction(async (tx) => {
     await tx.barbershop.update({
@@ -409,7 +393,7 @@ adminRouter.patch("/shops/:id", validate(shopBase.partial()), async (req, res) =
               name: b.name,
               nameAr: emptyToNull(b.nameAr),
               nameCkb: emptyToNull(b.nameCkb),
-              phone: b.phone,
+              email: b.email,
               isActive: b.isActive,
             },
           });
@@ -420,14 +404,14 @@ adminRouter.patch("/shops/:id", validate(shopBase.partial()), async (req, res) =
               name: b.name,
               nameAr: emptyToNull(b.nameAr) ?? null,
               nameCkb: emptyToNull(b.nameCkb) ?? null,
-              phone: b.phone,
+              email: b.email,
               isActive: b.isActive,
             },
           });
         }
       }
     }
-  }).catch(rethrowBarberPhoneConflict);
+  }).catch(rethrowBarberEmailConflict);
   res.json({ ok: true });
 });
 
@@ -679,7 +663,7 @@ adminRouter.get("/reservations", validate(resListSchema, "query"), async (req, r
     prisma.reservation.findMany({
       where,
       include: {
-        user: { select: { name: true, phone: true } },
+        user: { select: { name: true, email: true } },
         shop: { select: { name: true } },
         service: { select: { name: true, price: true } },
         barber: { select: { name: true } },
@@ -694,7 +678,7 @@ adminRouter.get("/reservations", validate(resListSchema, "query"), async (req, r
       id: r.id,
       status: r.status === "CONFIRMED" && r.endsAt < new Date() ? "COMPLETED" : r.status,
       startsAt: r.startsAt.toISOString(),
-      customer: r.user.name ?? r.user.phone,
+      customer: r.user.name ?? r.user.email,
       shopName: r.shop.name,
       serviceName: r.service.name,
       barberName: r.barber?.name ?? null,

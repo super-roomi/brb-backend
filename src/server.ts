@@ -6,8 +6,12 @@ import { logger } from "./lib/logger.js";
 const app = createApp();
 
 const server = app.listen(env.port, () => {
-  logger.info({ port: env.port, smsProvider: env.smsProvider }, "Barber API listening");
-  if (env.smsProvider === "console") logger.info("SMS provider is console — OTP codes print here");
+  logger.info({ port: env.port, googleConfigured: env.googleConfigured }, "Barber API listening");
+  if (!env.googleConfigured) {
+    logger.warn(
+      "GOOGLE_CLIENT_ID is the placeholder — Google sign-in will fail; use /api/auth/test-login for development",
+    );
+  }
 });
 
 // Don't let a slow/stuck client hold a socket forever.

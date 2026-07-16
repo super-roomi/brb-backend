@@ -23,7 +23,12 @@ model City {
 
 model User {
   id            String         @id @default(cuid())
-  phone         String         @unique // E.164, e.g. +9647501234567
+  // Google account email (lowercased). Sign-in is Google OAuth only; rows
+  // migrated from the old phone era carry "<phone>@phone.migrated" until the
+  // person signs in with Google and the row is linked by email.
+  email         String         @unique
+  // Google `sub` claim — the stable account id. Null until first Google login.
+  googleId      String?        @unique
   name          String?
   createdAt     DateTime       @default(now())
   reservations  Reservation[]
@@ -54,18 +59,6 @@ model AdminUser {
   passwordHash String
   name         String
   createdAt    DateTime @default(now())
-}
-
-model OtpRequest {
-  id          String   @id @default(cuid())
-  phone       String
-  codeHash    String
-  expiresAt   DateTime
-  attempts    Int      @default(0)
-  consumedAt  DateTime?
-  createdAt   DateTime @default(now())
-
-  @@index([phone, createdAt])
 }
 
 model RefreshToken {
@@ -170,9 +163,10 @@ model Barber {
   name         String
   nameAr       String?
   nameCkb      String?
-  // E.164, unique across all barbers. A barber logs into the mobile app with
-  // this number (same phone+OTP flow as customers) to see their own stats.
-  phone        String        @unique
+  // Google account email, unique across all barbers. A barber logs into the
+  // mobile app with this Google account (same OAuth flow as customers) and the
+  // barber dashboard unlocks when it matches this row.
+  email        String        @unique
   isActive     Boolean       @default(true)
   // When true, incoming booking requests for this barber are confirmed
   // automatically instead of waiting in the requests queue.

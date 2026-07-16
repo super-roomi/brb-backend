@@ -12,7 +12,7 @@ let shopId: string;
 let serviceId: string;
 let barberAId: string;
 let barberBId: string;
-let barberAPhone: string;
+let barberAEmail: string;
 let custToken: string;
 let cust2Token: string;
 let barberAToken: string;
@@ -33,7 +33,7 @@ beforeAll(async () => {
     data: { name: "Barber Plan", monthlyPrice: 10_000, features: "", isFeaturedTier: false },
   });
   planId = plan.id;
-  barberAPhone = "+9647709000001";
+  barberAEmail = "barber.a@test.dev";
 
   const allWeek = Array.from({ length: 7 }, (_, weekday) => ({
     weekday,
@@ -55,8 +55,8 @@ beforeAll(async () => {
       openingHours: { create: allWeek },
       barbers: {
         create: [
-          { name: "Barber A", phone: barberAPhone },
-          { name: "Barber B", phone: "+9647709000002" },
+          { name: "Barber A", email: barberAEmail },
+          { name: "Barber B", email: "barber.b@test.dev" },
         ],
       },
       subscription: {
@@ -75,12 +75,11 @@ beforeAll(async () => {
   barberAId = shop.barbers[0].id;
   barberBId = shop.barbers[1].id;
 
-  custToken = await newUser("+9647508000001");
-  cust2Token = await newUser("+9647508000002");
-  // Barber logs in once with their barber phone; reused (OTP resend cooldown
-  // is per-phone, so re-logging in the same test run would hit the cooldown).
-  barberAToken = await newUser(barberAPhone);
-  barberBToken = await newUser("+9647709000002");
+  custToken = await newUser("u7508000001@test.dev");
+  cust2Token = await newUser("u7508000002@test.dev");
+  // Barber signs in with the same email their Barber row carries.
+  barberAToken = await newUser(barberAEmail);
+  barberBToken = await newUser("barber.b@test.dev");
 });
 
 describe("barbers in catalog", () => {
@@ -129,7 +128,7 @@ describe("per-barber capacity", () => {
   });
 
   it("now both barbers are taken → next booking at that slot fails", async () => {
-    const third = await newUser("+9647508000003");
+    const third = await newUser("u7508000003@test.dev");
     const res = await request(app)
       .post("/api/reservations")
       .set(auth(third))
@@ -146,7 +145,7 @@ describe("barber self-service", () => {
     expect(res.body.isBarber).toBe(false);
   });
 
-  it("recognizes a barber who logs in with their barber phone", async () => {
+  it("recognizes a barber who signs in with their barber email", async () => {
     const me = await request(app).get("/api/barber/me").set(auth(barberAToken));
     expect(me.status).toBe(200);
     expect(me.body.isBarber).toBe(true);
@@ -155,7 +154,7 @@ describe("barber self-service", () => {
 
   it("returns stats with earnings from completed cuts", async () => {
     // Seed a completed (past) reservation assigned to Barber A.
-    const cust = await prisma.user.findFirst({ where: { phone: "+9647508000001" } });
+    const cust = await prisma.user.findFirst({ where: { email: "u7508000001@test.dev" } });
     await prisma.reservation.create({
       data: {
         userId: cust!.id,
@@ -182,7 +181,7 @@ describe("barber self-service", () => {
   });
 });
 
-describe("admin: barber phone uniqueness", () => {
+describe("admin: barber email uniqueness", () => {
   let adminToken: string;
   beforeAll(async () => {
     const bcrypt = (await import("bcryptjs")).default;
@@ -195,23 +194,23 @@ describe("admin: barber phone uniqueness", () => {
     adminToken = res.body.accessToken;
   });
 
-  it("rejects a new shop reusing an existing barber phone", async () => {
+  it("rejects a new shop reusing an existing barber email", async () => {
     const res = await request(app)
       .post("/api/admin/shops")
       .set(auth(adminToken))
       .send({
         name: "Copycat Shop",
-        description: "Tries to steal a barber phone.",
+        description: "Tries to steal a barber email.",
         address: "9 Copy Street",
         phone: "+9647500000099",
         cityId,
         chairCount: 1,
         openingHours: [{ weekday: 1, openMinute: 540, closeMinute: 1080 }],
         services: [{ name: "Cut", durationMin: 30, price: 12_000, isActive: true }],
-        barbers: [{ name: "Impostor", phone: barberAPhone, isActive: true }],
+        barbers: [{ name: "Impostor", email: barberAEmail, isActive: true }],
       });
     expect(res.status).toBe(409);
-    expect(res.body.error.code).toBe("BARBER_PHONE_TAKEN");
+    expect(res.body.error.code).toBe("BARBER_EMAIL_TAKEN");
   });
 });
 
@@ -219,7 +218,7 @@ describe("booking approval workflow", () => {
   const date = openDate();
 
   it("new bookings are PENDING and hold the slot", async () => {
-    const cust = await newUser("+9647508009001");
+    const cust = await newUser("u7508009001@test.dev");
     const booking = await request(app)
       .post("/api/reservations")
       .set(auth(cust))
@@ -228,7 +227,7 @@ describe("booking approval workflow", () => {
     expect(booking.body.reservation.status).toBe("PENDING");
 
     // A pending request blocks the same barber/time.
-    const other = await newUser("+9647508009009");
+    const other = await newUser("u7508009009@test.dev");
     const clash = await request(app)
       .post("/api/reservations")
       .set(auth(other))
@@ -237,7 +236,7 @@ describe("booking approval workflow", () => {
   });
 
   it("shows the pending booking in the customer's upcoming list", async () => {
-    const cust = await newUser("+9647508009002");
+    const cust = await newUser("u7508009002@test.dev");
     const booking = await request(app)
       .post("/api/reservations")
       .set(auth(cust))
@@ -254,7 +253,7 @@ describe("booking approval workflow", () => {
   });
 
   it("barber accepts a request → CONFIRMED, customer notified, shows upcoming", async () => {
-    const cust = await newUser("+9647508009003");
+    const cust = await newUser("u7508009003@test.dev");
     const booking = await request(app)
       .post("/api/reservations")
       .set(auth(cust))
@@ -284,7 +283,7 @@ describe("booking approval workflow", () => {
   });
 
   it("barber declines → DECLINED, customer notified, frees the slot", async () => {
-    const cust = await newUser("+9647508009004");
+    const cust = await newUser("u7508009004@test.dev");
     const booking = await request(app)
       .post("/api/reservations")
       .set(auth(cust))
@@ -301,7 +300,7 @@ describe("booking approval workflow", () => {
     expect(notifs.body.notifications[0].type).toBe("BOOKING_DECLINED");
 
     // Declined frees the slot — someone else can now book it.
-    const other = await newUser("+9647508009005");
+    const other = await newUser("u7508009005@test.dev");
     const rebook = await request(app)
       .post("/api/reservations")
       .set(auth(other))
@@ -310,7 +309,7 @@ describe("booking approval workflow", () => {
   });
 
   it("only the assigned barber may decide", async () => {
-    const cust = await newUser("+9647508009006");
+    const cust = await newUser("u7508009006@test.dev");
     const booking = await request(app)
       .post("/api/reservations")
       .set(auth(cust))
@@ -324,7 +323,7 @@ describe("booking approval workflow", () => {
   });
 
   it("limits a customer to one active booking at a time", async () => {
-    const cust = await newUser("+9647508009008");
+    const cust = await newUser("u7508009008@test.dev");
     const first = await request(app)
       .post("/api/reservations")
       .set(auth(cust))
@@ -358,7 +357,7 @@ describe("booking approval workflow", () => {
     expect(on.status).toBe(200);
     expect(on.body.autoApprove).toBe(true);
 
-    const cust = await newUser("+9647508009010");
+    const cust = await newUser("u7508009010@test.dev");
     const booking = await request(app)
       .post("/api/reservations")
       .set(auth(cust))
@@ -374,7 +373,7 @@ describe("booking approval workflow", () => {
 
   it("enabling auto-approve clears the pending queue and notifies", async () => {
     await request(app).patch("/api/barber/auto-approve").set(auth(barberBToken)).send({ enabled: false });
-    const cust = await newUser("+9647508009011");
+    const cust = await newUser("u7508009011@test.dev");
     const booking = await request(app)
       .post("/api/reservations")
       .set(auth(cust))
@@ -402,7 +401,7 @@ describe("booking approval workflow", () => {
   });
 
   it("today returns the barber's confirmed appointments for today", async () => {
-    const cust = await prisma.user.findFirst({ where: { phone: "+9647508000001" } });
+    const cust = await prisma.user.findFirst({ where: { email: "u7508000001@test.dev" } });
     await prisma.reservation.create({
       data: {
         userId: cust!.id,
@@ -422,7 +421,7 @@ describe("booking approval workflow", () => {
   });
 
   it("rejects deciding an already-handled request", async () => {
-    const cust = await newUser("+9647508009007");
+    const cust = await newUser("u7508009007@test.dev");
     const booking = await request(app)
       .post("/api/reservations")
       .set(auth(cust))
@@ -441,10 +440,7 @@ function auth(token: string) {
   return { Authorization: `Bearer ${token}` };
 }
 
-async function newUser(phone: string): Promise<string> {
-  const reqRes = await request(app).post("/api/auth/otp/request").send({ phone });
-  const verifyRes = await request(app)
-    .post("/api/auth/otp/verify")
-    .send({ requestId: reqRes.body.requestId, phone, code: reqRes.body.devCode });
-  return verifyRes.body.accessToken;
+async function newUser(email: string): Promise<string> {
+  const res = await request(app).post("/api/auth/test-login").send({ email });
+  return res.body.accessToken;
 }

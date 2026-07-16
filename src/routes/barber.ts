@@ -11,14 +11,14 @@ import { sendPushToUser } from "../lib/push.js";
 export const barberRouter = Router();
 barberRouter.use(requireUser);
 
-// A barber is a customer (User) whose phone also exists in the Barber table.
-// No separate login: they sign in with phone+OTP like anyone else, and these
-// endpoints unlock when their phone matches a barber record.
+// A barber is a customer (User) whose email also exists in the Barber table.
+// No separate login: they sign in with Google like anyone else, and these
+// endpoints unlock when their email matches a barber record.
 async function barberForRequest(userId: string) {
   const user = await prisma.user.findUnique({ where: { id: userId } });
   if (!user) throw ApiError.unauthorized();
   return prisma.barber.findUnique({
-    where: { phone: user.phone },
+    where: { email: user.email },
     include: { shop: { select: { id: true, name: true, nameAr: true, nameCkb: true } } },
   });
 }
@@ -188,7 +188,7 @@ barberRouter.get("/today", async (req, res) => {
     },
     include: {
       service: { select: { name: true, nameAr: true, nameCkb: true, durationMin: true } },
-      user: { select: { name: true, phone: true } },
+      user: { select: { name: true, email: true } },
     },
     orderBy: { startsAt: "asc" },
   });
@@ -200,7 +200,7 @@ barberRouter.get("/today", async (req, res) => {
       id: r.id,
       serviceName: localize(lang, r.service.name, r.service.nameAr, r.service.nameCkb),
       durationMin: r.service.durationMin,
-      customerName: r.user.name ?? r.user.phone,
+      customerName: r.user.name ?? r.user.email,
       price: r.price,
       startsAt: r.startsAt.toISOString(),
       done: r.endsAt < now,
@@ -217,7 +217,7 @@ barberRouter.get("/requests", async (req, res) => {
     where: { barberId: barber.id, status: "PENDING", endsAt: { gte: new Date() } },
     include: {
       service: { select: { name: true, nameAr: true, nameCkb: true, durationMin: true } },
-      user: { select: { name: true, phone: true } },
+      user: { select: { name: true, email: true } },
       shop: { select: { utcOffsetMinutes: true } },
     },
     orderBy: { startsAt: "asc" },
@@ -229,7 +229,7 @@ barberRouter.get("/requests", async (req, res) => {
       id: r.id,
       serviceName: localize(lang, r.service.name, r.service.nameAr, r.service.nameCkb),
       durationMin: r.service.durationMin,
-      customerName: r.user.name ?? r.user.phone,
+      customerName: r.user.name ?? r.user.email,
       price: r.price,
       startsAt: r.startsAt.toISOString(),
       utcOffsetMinutes: r.shop.utcOffsetMinutes,
@@ -272,7 +272,7 @@ barberRouter.get("/customers", async (req, res) => {
 
   const users = await prisma.user.findMany({
     where: { id: { in: top.map((r) => r.userId) } },
-    select: { id: true, name: true, phone: true },
+    select: { id: true, name: true, email: true },
   });
   const userById = new Map(users.map((u) => [u.id, u]));
 
@@ -280,8 +280,8 @@ barberRouter.get("/customers", async (req, res) => {
     const u = userById.get(r.userId);
     const c = completedByUser.get(r.userId);
     return {
-      name: u?.name ?? u?.phone ?? "Customer",
-      phone: u?.phone ?? "",
+      name: u?.name ?? u?.email ?? "Customer",
+      email: u?.email ?? "",
       visits: c?._count._all ?? 0,
       lastVisit: (r._max.startsAt ?? now).toISOString(),
       spent: c?._sum.price ?? 0,

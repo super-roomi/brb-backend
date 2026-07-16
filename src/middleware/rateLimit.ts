@@ -14,23 +14,16 @@ export const generalLimiter = rateLimit({
   skip,
 });
 
-// Strict: OTP requests cost money (SMS) and are the main abuse target.
-export const otpRequestLimiter = rateLimit({
+// Login endpoints (/auth/google, /auth/test-login): each hit costs a Google
+// token verification and can mint sessions, so keep it well below the general
+// limiter while allowing normal retry behaviour.
+export const authLimiter = rateLimit({
   windowMs: 15 * 60_000,
-  limit: 5,
+  limit: 20,
   standardHeaders: true,
   legacyHeaders: false,
   skip,
-  message: { error: { code: "RATE_LIMITED", message: "Too many OTP requests. Try again later." } },
-});
-
-export const otpVerifyLimiter = rateLimit({
-  windowMs: 15 * 60_000,
-  limit: 15,
-  standardHeaders: true,
-  legacyHeaders: false,
-  skip,
-  message: { error: { code: "RATE_LIMITED", message: "Too many attempts. Try again later." } },
+  message: { error: { code: "RATE_LIMITED", message: "Too many sign-in attempts. Try again later." } },
 });
 
 // Admin login is a single high-value credential; throttle it hard so the

@@ -1,8 +1,16 @@
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import request from "supertest";
 import { createApp } from "../src/app.js";
 import { prisma } from "../src/lib/prisma.js";
+import { ApiError } from "../src/lib/errors.js";
 import { weekdayOfLocalDate } from "../src/lib/time.js";
+import { verifyGoogleIdToken } from "../src/lib/googleAuth.js";
+
+// Real verification needs Google credentials; tests inject identities instead.
+vi.mock("../src/lib/googleAuth.js", () => ({
+  verifyGoogleIdToken: vi.fn(),
+}));
+const mockVerifyGoogle = vi.mocked(verifyGoogleIdToken);
 
 const app = createApp();
 
@@ -105,63 +113,83 @@ describe("health", () => {
   });
 });
 
-describe("auth: phone + OTP", () => {
-  const phone = "+9647501112233";
+describe("auth: Google OAuth + test-login", () => {
+  const email = "main@test.dev";
 
-  it("rejects malformed phone numbers", async () => {
-    const res = await request(app).post("/api/auth/otp/request").send({ phone: "12345678" });
+  it("rejects a malformed test-login email", async () => {
+    const res = await request(app)
+      .post("/api/auth/test-login")
+      .send({ email: "not-an-email" });
     expect(res.status).toBe(400);
-    expect(res.body.error.code).toBe("INVALID_PHONE");
   });
 
-  it("issues an OTP and verifies it, creating the user", async () => {
-    const reqRes = await request(app).post("/api/auth/otp/request").send({ phone });
-    expect(reqRes.status).toBe(200);
-    expect(reqRes.body.requestId).toBeTruthy();
-    expect(reqRes.body.devCode).toMatch(/^\d{6}$/);
+  it("test-login creates the user and issues tokens", async () => {
+    const res = await request(app)
+      .post("/api/auth/test-login")
+      .send({ email, name: "Test User" });
+    expect(res.status).toBe(200);
+    expect(res.body.isNewUser).toBe(true);
+    expect(res.body.user.email).toBe(email);
+    expect(res.body.user.name).toBe("Test User");
+    userToken = res.body.accessToken;
+    userRefresh = res.body.refreshToken;
 
-    const wrong = await request(app)
-      .post("/api/auth/otp/verify")
-      .send({ requestId: reqRes.body.requestId, phone, code: "000000" });
-    // Astronomically unlikely the random code is 000000; treat 200 as fluke-proofed by next assert
-    if (wrong.status !== 200) {
-      expect(wrong.body.error.code).toBe("OTP_WRONG");
-    }
-
-    const verifyRes = await request(app)
-      .post("/api/auth/otp/verify")
-      .send({
-        requestId: reqRes.body.requestId,
-        phone,
-        code: reqRes.body.devCode,
-        name: "Test User",
-      });
-    expect(verifyRes.status).toBe(200);
-    expect(verifyRes.body.isNewUser).toBe(true);
-    expect(verifyRes.body.user.name).toBe("Test User");
-    userToken = verifyRes.body.accessToken;
-    userRefresh = verifyRes.body.refreshToken;
+    const again = await request(app).post("/api/auth/test-login").send({ email });
+    expect(again.status).toBe(200);
+    expect(again.body.isNewUser).toBe(false);
   });
 
-  it("rejects OTP reuse", async () => {
-    const reqRes = await request(app).post("/api/auth/otp/request").send({ phone: "+9647501112299" });
-    // cooldown applies per-phone, new phone fine
-    const v1 = await request(app)
-      .post("/api/auth/otp/verify")
-      .send({ requestId: reqRes.body.requestId, phone: "+9647501112299", code: reqRes.body.devCode });
-    expect(v1.status).toBe(200);
-    const v2 = await request(app)
-      .post("/api/auth/otp/verify")
-      .send({ requestId: reqRes.body.requestId, phone: "+9647501112299", code: reqRes.body.devCode });
-    expect(v2.status).toBe(400);
-    expect(v2.body.error.code).toBe("OTP_USED");
-  });
-
-  it("enforces resend cooldown", async () => {
-    const first = await request(app).post("/api/auth/otp/request").send({ phone: "+9647501112255" });
+  it("google sign-in creates a user, then recognizes them by googleId", async () => {
+    mockVerifyGoogle.mockResolvedValue({
+      googleId: "g-sub-1",
+      email: "google.user@test.dev",
+      name: "Google User",
+    });
+    const first = await request(app)
+      .post("/api/auth/google")
+      .send({ idToken: "x".repeat(32) });
     expect(first.status).toBe(200);
-    const second = await request(app).post("/api/auth/otp/request").send({ phone: "+9647501112255" });
-    expect(second.status).toBe(429);
+    expect(first.body.isNewUser).toBe(true);
+    expect(first.body.user.email).toBe("google.user@test.dev");
+    expect(first.body.user.name).toBe("Google User");
+
+    const second = await request(app)
+      .post("/api/auth/google")
+      .send({ idToken: "x".repeat(32) });
+    expect(second.status).toBe(200);
+    expect(second.body.isNewUser).toBe(false);
+    expect(second.body.user.id).toBe(first.body.user.id);
+  });
+
+  it("google sign-in links a pre-existing user row by email", async () => {
+    const pre = await prisma.user.create({
+      data: { email: "linked@test.dev", name: "Pre Existing" },
+    });
+    mockVerifyGoogle.mockResolvedValue({
+      googleId: "g-sub-2",
+      email: "linked@test.dev",
+      name: "Ignored — row already has a name",
+    });
+    const res = await request(app)
+      .post("/api/auth/google")
+      .send({ idToken: "x".repeat(32) });
+    expect(res.status).toBe(200);
+    expect(res.body.isNewUser).toBe(false);
+    expect(res.body.user.id).toBe(pre.id);
+    expect(res.body.user.name).toBe("Pre Existing");
+    const row = await prisma.user.findUnique({ where: { id: pre.id } });
+    expect(row!.googleId).toBe("g-sub-2");
+  });
+
+  it("rejects an invalid google token", async () => {
+    mockVerifyGoogle.mockRejectedValue(
+      ApiError.unauthorized("Google sign-in failed", "GOOGLE_TOKEN_INVALID"),
+    );
+    const res = await request(app)
+      .post("/api/auth/google")
+      .send({ idToken: "x".repeat(32) });
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe("GOOGLE_TOKEN_INVALID");
   });
 
   it("rotates refresh tokens and kills the old one", async () => {
@@ -176,7 +204,7 @@ describe("auth: phone + OTP", () => {
   it("returns the profile with a valid token and rejects without", async () => {
     const me = await request(app).get("/api/auth/me").set(auth(userToken));
     expect(me.status).toBe(200);
-    expect(me.body.user.phone).toBe(phone);
+    expect(me.body.user.email).toBe(email);
     const anon = await request(app).get("/api/auth/me");
     expect(anon.status).toBe(401);
   });
@@ -231,7 +259,7 @@ describe("reservations", () => {
     expect(ok.status).toBe(201);
     expect(ok.body.reservation.status).toBe("PENDING");
 
-    const other = await newUserToken("+9647501112277");
+    const other = await newUserToken("other@test.dev");
     const clash = await request(app)
       .post("/api/reservations")
       .set(auth(other))
@@ -289,7 +317,7 @@ describe("reservations", () => {
   });
 
   it("enforces the cancellation cutoff", async () => {
-    const user = await prisma.user.findUnique({ where: { phone: "+9647501112233" } });
+    const user = await prisma.user.findUnique({ where: { email: "main@test.dev" } });
     const soon = await prisma.reservation.create({
       data: {
         userId: user!.id,
@@ -316,14 +344,8 @@ describe("reservation concurrency", () => {
     // check — every request is eligible, so only slot capacity should stop the
     // losers. Without the Serializable transaction these would all read "free"
     // and all insert; exactly one 201 is the guarantee we're protecting.
-    const phones = [
-      "+9647500010001",
-      "+9647500010002",
-      "+9647500010003",
-      "+9647500010004",
-      "+9647500010005",
-    ];
-    const tokens = await Promise.all(phones.map((p) => newUserToken(p)));
+    const emails = [1, 2, 3, 4, 5].map((n) => `racer${n}@test.dev`);
+    const tokens = await Promise.all(emails.map((e) => newUserToken(e)));
     const startMinute = 15 * 60; // 15:00 — not used by other reservation tests
 
     const results = await Promise.all(
@@ -338,14 +360,14 @@ describe("reservation concurrency", () => {
     const created = results.filter((r) => r.status === 201);
     const conflicts = results.filter((r) => r.status === 409);
     expect(created).toHaveLength(1);
-    expect(conflicts).toHaveLength(phones.length - 1);
+    expect(conflicts).toHaveLength(emails.length - 1);
     for (const c of conflicts) expect(c.body.error.code).toBe("SLOT_TAKEN");
   });
 });
 
 describe("reviews", () => {
   it("blocks reviews without a completed visit", async () => {
-    const fresh = await newUserToken("+9647501112288");
+    const fresh = await newUserToken("fresh@test.dev");
     const res = await request(app)
       .put(`/api/shops/${shopId}/review`)
       .set(auth(fresh))
@@ -355,7 +377,7 @@ describe("reviews", () => {
   });
 
   it("accepts a review after a completed visit and updates the aggregate", async () => {
-    const user = await prisma.user.findUnique({ where: { phone: "+9647501112233" } });
+    const user = await prisma.user.findUnique({ where: { email: "main@test.dev" } });
     await prisma.reservation.create({
       data: {
         userId: user!.id,
@@ -623,7 +645,7 @@ describe("booking grace period (bufferMin)", () => {
   it("blocks slots inside the grace window and frees the first one past it", async () => {
     // First customer books 10:00–10:30. With a 20-min buffer the same chair is
     // blocked until 10:50, so 10:30 and 10:45 must vanish; 11:00 stays.
-    const a = await newUserToken("+9647500020001");
+    const a = await newUserToken("notify.a@test.dev");
     const book = await request(app)
       .post("/api/reservations")
       .set(auth(a))
@@ -642,7 +664,7 @@ describe("booking grace period (bufferMin)", () => {
     expect(minutes).not.toContain(570);
 
     // Direct API attempt inside the grace window is rejected server-side.
-    const b = await newUserToken("+9647500020002");
+    const b = await newUserToken("notify.b@test.dev");
     const tooClose = await request(app)
       .post("/api/reservations")
       .set(auth(b))
@@ -692,10 +714,7 @@ function auth(token: string) {
   return { Authorization: `Bearer ${token}` };
 }
 
-async function newUserToken(phone: string): Promise<string> {
-  const reqRes = await request(app).post("/api/auth/otp/request").send({ phone });
-  const verifyRes = await request(app)
-    .post("/api/auth/otp/verify")
-    .send({ requestId: reqRes.body.requestId, phone, code: reqRes.body.devCode });
-  return verifyRes.body.accessToken;
+async function newUserToken(email: string): Promise<string> {
+  const res = await request(app).post("/api/auth/test-login").send({ email });
+  return res.body.accessToken;
 }

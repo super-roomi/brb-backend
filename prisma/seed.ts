@@ -65,9 +65,9 @@ async function main() {
         { name: "Haircut + Beard Combo", durationMin: 45, price: 20_000 },
       ],
       barbers: [
-        { name: "Aland Kareem", phone: "+9647701000001" },
-        { name: "Rebin Salih", phone: "+9647701000002" },
-        { name: "Hemin Aziz", phone: "+9647701000003" },
+        { name: "Aland Kareem", email: "aland.kareem@barberapp.dev" },
+        { name: "Rebin Salih", email: "rebin.salih@barberapp.dev" },
+        { name: "Hemin Aziz", email: "hemin.aziz@barberapp.dev" },
       ],
     },
     {
@@ -90,8 +90,8 @@ async function main() {
         { name: "Line-up", durationMin: 15, price: 6_000 },
       ],
       barbers: [
-        { name: "Karwan Jamal", phone: "+9647702000001" },
-        { name: "Diyar Omar", phone: "+9647702000002" },
+        { name: "Karwan Jamal", email: "karwan.jamal@barberapp.dev" },
+        { name: "Diyar Omar", email: "diyar.omar@barberapp.dev" },
       ],
     },
     {
@@ -112,8 +112,8 @@ async function main() {
         { name: "Grooming Package", durationMin: 60, price: 30_000 },
       ],
       barbers: [
-        { name: "Shwan Ali", phone: "+9647703000001" },
-        { name: "Bahroz Nuri", phone: "+9647703000002" },
+        { name: "Shwan Ali", email: "shwan.ali@barberapp.dev" },
+        { name: "Bahroz Nuri", email: "bahroz.nuri@barberapp.dev" },
       ],
     },
   ];
@@ -156,10 +156,17 @@ async function main() {
     });
   }
 
+  // Developer test user — what POST /api/auth/test-login signs in as.
+  await prisma.user.upsert({
+    where: { email: "tester@barberapp.dev" },
+    create: { email: "tester@barberapp.dev", name: "Test User" },
+    update: {},
+  });
+
   // Demo customer with a completed visit at each shop + a review.
   const demoUser = await prisma.user.upsert({
-    where: { phone: "+9647509999999" },
-    create: { phone: "+9647509999999", name: "Demo Customer" },
+    where: { email: "demo@barberapp.dev" },
+    create: { email: "demo@barberapp.dev", name: "Demo Customer" },
     update: {},
   });
 
@@ -234,8 +241,9 @@ async function main() {
 
   console.log("Seed complete.");
   console.log(`Admin login: ${adminEmail} / ${adminPassword}`);
-  console.log("Demo customer phone: +9647509999999 (OTP prints to this console)");
-  console.log("Demo BARBER login: +9647701000001 (Aland Kareem @ The Heritage Grooming Co.)");
+  console.log("Dev login: POST /api/auth/test-login (tester@barberapp.dev), or the app's test-login button");
+  console.log("Demo customer: demo@barberapp.dev (test-login with {\"email\":\"demo@barberapp.dev\"})");
+  console.log("Demo BARBER: aland.kareem@barberapp.dev (Aland Kareem @ The Heritage Grooming Co.)");
 }
 
 main()
