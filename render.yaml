@@ -43,15 +43,13 @@ services:
       # Prompted for in the dashboard on first deploy.
       - key: CORS_ORIGINS
         sync: false
-      # console = OTP codes print to logs (staging). Set to `twilio` + the
-      # TWILIO_* vars below for real SMS.
-      - key: SMS_PROVIDER
-        value: console
-      - key: TWILIO_ACCOUNT_SID
+      # Google OAuth client id(s) accepted as ID-token audience. While unset
+      # (or left as the placeholder) /api/auth/google returns 503.
+      - key: GOOGLE_CLIENT_ID
         sync: false
-      - key: TWILIO_AUTH_TOKEN
-        sync: false
-      - key: TWILIO_FROM_NUMBER
+      # Set to `true` to expose the password-less /api/auth/test-login on this
+      # production-mode deploy. STAGING ONLY — remove before real launch.
+      - key: ENABLE_TEST_LOGIN
         sync: false
       # Whole Firebase service-account JSON as one value (see DEPLOYMENT.md).
       # Leave empty to run without push — the API no-ops FCM when unset.

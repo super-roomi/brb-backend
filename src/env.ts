@@ -47,7 +47,9 @@ export const env = {
   googleConfigured: !googleClientIds.includes(GOOGLE_CLIENT_ID_PLACEHOLDER),
   // Password-less developer login. Never enabled in production unless the
   // operator opts in explicitly (e.g. a staging deploy behind other controls).
-  testLoginEnabled: !isProd || process.env.ENABLE_TEST_LOGIN === "true",
+  // Forgiving parse (true/1/yes, any case) — a "True" typed into a dashboard
+  // env-var field shouldn't silently keep the gate closed.
+  testLoginEnabled: !isProd || /^(true|1|yes)$/i.test((process.env.ENABLE_TEST_LOGIN ?? "").trim()),
   corsOrigins: (process.env.CORS_ORIGINS ?? "http://localhost:5173")
     .split(",")
     .map((s) => s.trim())

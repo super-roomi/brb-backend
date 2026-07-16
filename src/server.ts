@@ -6,7 +6,17 @@ import { logger } from "./lib/logger.js";
 const app = createApp();
 
 const server = app.listen(env.port, () => {
-  logger.info({ port: env.port, googleConfigured: env.googleConfigured }, "Barber API listening");
+  logger.info(
+    {
+      port: env.port,
+      googleConfigured: env.googleConfigured,
+      testLoginEnabled: env.testLoginEnabled,
+    },
+    "Barber API listening",
+  );
+  if (env.isProd && env.testLoginEnabled) {
+    logger.warn("ENABLE_TEST_LOGIN is on — password-less /api/auth/test-login is PUBLIC. Staging only.");
+  }
   if (!env.googleConfigured) {
     logger.warn(
       "GOOGLE_CLIENT_ID is the placeholder — Google sign-in will fail; use /api/auth/test-login for development",
