@@ -63,6 +63,10 @@ catalogRouter.get("/shops", validate(listSchema, "query"), async (req, res) => {
     address: s.address,
     imageUrl: s.imageUrl,
     city: s.city,
+    // Coordinates power the app's "Quick booking" nearest-shop pick. Already
+    // public on the shop detail endpoint, so no new exposure.
+    latitude: s.latitude,
+    longitude: s.longitude,
     ratingAvg: s.ratingAvg,
     ratingCount: s.ratingCount,
     isFeatured: s.subscription?.plan.isFeaturedTier ?? false,
