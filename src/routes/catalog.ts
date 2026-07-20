@@ -45,7 +45,11 @@ catalogRouter.get("/shops", validate(listSchema, "query"), async (req, res) => {
       where,
       include: {
         city: { select: { id: true, name: true } },
-        subscription: { select: { plan: { select: { isFeaturedTier: true } } } },
+        subscription: {
+          select: {
+            plan: { select: { isFeaturedTier: true, monthlyPrice: true } },
+          },
+        },
       },
       orderBy:
         q.sort === "rating"
@@ -70,6 +74,10 @@ catalogRouter.get("/shops", validate(listSchema, "query"), async (req, res) => {
     ratingAvg: s.ratingAvg,
     ratingCount: s.ratingCount,
     isFeatured: s.subscription?.plan.isFeaturedTier ?? false,
+    // Subscription-tier weight for the app's quick-booking recommendation
+    // (higher = better placement). The plan's monthly price doubles as the
+    // ordering value; visible shops always have an active subscription.
+    tierRank: s.subscription?.plan.monthlyPrice ?? 0,
   }));
 
   // Browse traffic dwarfs writes; a short public cache absorbs repeat opens.
