@@ -29,6 +29,10 @@ model User {
   email         String         @unique
   // Google `sub` claim — the stable account id. Null until first Google login.
   googleId      String?        @unique
+  // Apple `sub` claim — the stable account id. Null until first Apple login.
+  // Sign in with Apple may hand back a private @privaterelay.appleid.com email,
+  // so users are matched by this id first, not by address.
+  appleId       String?        @unique
   name          String?
   createdAt     DateTime       @default(now())
   reservations  Reservation[]

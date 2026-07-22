@@ -34,6 +34,16 @@ const googleClientIds = (process.env.GOOGLE_CLIENT_ID ?? GOOGLE_CLIENT_ID_PLACEH
   .map((s) => s.trim())
   .filter(Boolean);
 
+// Accepted `aud` values for Apple identity tokens. For the native iOS flow the
+// audience is the app's bundle id, which is fixed and public — unlike Google,
+// verifying an Apple token needs no secret, so this defaults to the shipping
+// bundle id and works out of the box. Comma-separated to allow adding a future
+// Service ID (the web flow's client id) without a code change.
+const appleClientIds = (process.env.APPLE_CLIENT_ID ?? "com.barberapp.barberMobile")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 export const env = {
   nodeEnv: process.env.NODE_ENV ?? "development",
   port: Number(process.env.PORT ?? 4000),
@@ -45,6 +55,7 @@ export const env = {
   refreshTtlDays: Number(process.env.REFRESH_TOKEN_TTL_DAYS ?? 30),
   googleClientIds,
   googleConfigured: !googleClientIds.includes(GOOGLE_CLIENT_ID_PLACEHOLDER),
+  appleClientIds,
   // Password-less developer login. Never enabled in production unless the
   // operator opts in explicitly (e.g. a staging deploy behind other controls).
   // Forgiving parse (true/1/yes, any case) — a "True" typed into a dashboard

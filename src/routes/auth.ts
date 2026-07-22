@@ -4,6 +4,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { ApiError } from "../lib/errors.js";
 import { verifyGoogleIdToken, type GoogleIdentity } from "../lib/googleAuth.js";
+import { verifyAppleIdToken, type AppleIdentity } from "../lib/appleAuth.js";
 import { hashToken, newRefreshToken, signAccessToken } from "../lib/jwt.js";
 import { env } from "../env.js";
 import { validate, parsed } from "../middleware/validate.js";
@@ -26,6 +27,33 @@ authRouter.post(
     const { idToken } = parsed<z.infer<typeof googleSchema>>(req);
     const identity = await verifyGoogleIdToken(idToken);
     const { user, isNewUser } = await upsertGoogleUser(identity);
+
+    const tokens = await issueTokens(user.id);
+    res.json({
+      ...tokens,
+      isNewUser,
+      user: { id: user.id, email: user.email, name: user.name },
+    });
+  },
+);
+
+const appleSchema = z.object({
+  identityToken: z.string().min(20),
+  // Apple returns the user's name only on the very first authorization, and
+  // only to the client (never inside the token). The app forwards it here so we
+  // can store it once; it is absent on every later sign-in.
+  fullName: z.string().trim().min(1).max(60).optional(),
+});
+
+// Sign in (or up) with an Apple identity token obtained by the mobile app.
+authRouter.post(
+  "/apple",
+  authLimiter,
+  validate(appleSchema),
+  async (req, res) => {
+    const { identityToken, fullName } = parsed<z.infer<typeof appleSchema>>(req);
+    const identity = await verifyAppleIdToken(identityToken);
+    const { user, isNewUser } = await upsertAppleUser(identity, fullName ?? null);
 
     const tokens = await issueTokens(user.id);
     res.json({
@@ -180,6 +208,69 @@ async function upsertGoogleUser(identity: GoogleIdentity) {
     if (isUniqueViolation(e)) {
       const user = await prisma.user.findUnique({
         where: { googleId: identity.googleId },
+      });
+      if (user) return { user, isNewUser: false };
+    }
+    throw e;
+  }
+}
+
+// Match order mirrors Google: appleId (stable even when the person hides their
+// email), then email (links a row that already exists for the same real
+// address — e.g. they used Google first), then create.
+async function upsertAppleUser(identity: AppleIdentity, fullName: string | null) {
+  const byAppleId = await prisma.user.findUnique({
+    where: { appleId: identity.appleId },
+  });
+  if (byAppleId) {
+    // Apple only ever sends the name once, so backfill it if we missed it then
+    // (e.g. the first login failed after Apple had already consumed the name).
+    if (!byAppleId.name && fullName) {
+      const user = await prisma.user.update({
+        where: { id: byAppleId.id },
+        data: { name: fullName },
+      });
+      return { user, isNewUser: false };
+    }
+    return { user: byAppleId, isNewUser: false };
+  }
+
+  // No Apple link yet. We can only match or create when the token carried an
+  // email, which it always does on the first authorization. A returning login
+  // that omits the email must have matched by appleId above; if it didn't,
+  // there is nothing to key on, so fail rather than orphan the account.
+  if (!identity.email) {
+    throw ApiError.unauthorized("Apple sign-in failed", "APPLE_TOKEN_INVALID");
+  }
+
+  const byEmail = await prisma.user.findUnique({ where: { email: identity.email } });
+  if (byEmail) {
+    const user = await prisma.user
+      .update({
+        where: { id: byEmail.id },
+        data: { appleId: identity.appleId, name: byEmail.name ?? fullName },
+      })
+      .catch((e) => {
+        if (isUniqueViolation(e)) return byEmail;
+        throw e;
+      });
+    return { user, isNewUser: false };
+  }
+
+  try {
+    const user = await prisma.user.create({
+      data: {
+        email: identity.email,
+        appleId: identity.appleId,
+        name: fullName,
+      },
+    });
+    return { user, isNewUser: true };
+  } catch (e) {
+    // Two first-logins racing: the loser refetches the winner's row.
+    if (isUniqueViolation(e)) {
+      const user = await prisma.user.findUnique({
+        where: { appleId: identity.appleId },
       });
       if (user) return { user, isNewUser: false };
     }
