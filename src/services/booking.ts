@@ -1,6 +1,10 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { ApiError } from "../lib/errors.js";
+import { logger } from "../lib/logger.js";
+import { notifyUser } from "../lib/notify.js";
+import { localize, parseLang } from "../lib/localize.js";
+import { newReservation } from "../lib/notificationMessages.js";
 import { addDays, localDateToUtc, weekdayOfLocalDate } from "../lib/time.js";
 import { BOOKING_HORIZON_DAYS, BOOKING_LEAD_MIN, SLOT_STEP_MIN } from "./availability.js";
 
@@ -93,7 +97,7 @@ export async function createReservation(input: {
   // slips (e.g. a path that forgets the isolation level).
   for (let attempt = 0; ; attempt++) {
     try {
-      return await runBookingTx({
+      const reservation = await runBookingTx({
         userId,
         shopId,
         serviceId,
@@ -106,6 +110,9 @@ export async function createReservation(input: {
         servicePrice: service.price,
         specificBarber: barberId,
       });
+      // Let the assigned barber know a request/booking just came in.
+      void notifyBarberOfNewReservation(reservation);
+      return reservation;
     } catch (e) {
       if (isRetryableTxError(e) && attempt < MAX_BOOKING_RETRIES) continue;
       if (isOverlapExclusionViolation(e)) {
@@ -113,6 +120,50 @@ export async function createReservation(input: {
       }
       throw e;
     }
+  }
+}
+
+// Notify the assigned barber (by their app account, linked via email) that a
+// new reservation landed. No-op for chair-capacity shops with no barbers, or a
+// barber who hasn't signed into the app yet.
+async function notifyBarberOfNewReservation(r: {
+  id: string;
+  userId: string;
+  barberId: string | null;
+  status: string;
+  service: { name: string; nameAr: string | null; nameCkb: string | null };
+}): Promise<void> {
+  if (!r.barberId) return;
+  try {
+    const barber = await prisma.barber.findUnique({
+      where: { id: r.barberId },
+      select: { email: true },
+    });
+    if (!barber) return;
+    const [barberUser, customer] = await Promise.all([
+      prisma.user.findUnique({ where: { email: barber.email }, select: { id: true, lang: true } }),
+      prisma.user.findUnique({ where: { id: r.userId }, select: { name: true } }),
+    ]);
+    if (!barberUser) return;
+    const lang = parseLang(barberUser.lang);
+    const who =
+      customer?.name?.trim() ||
+      (lang === "ar" ? "أحد العملاء" : lang === "ckb" ? "کڕیارێک" : "A customer");
+    const pending = r.status === "PENDING";
+    await notifyUser({
+      userId: barberUser.id,
+      type: "NEW_RESERVATION",
+      reservationId: r.id,
+      lang,
+      build: (l) =>
+        newReservation(l, {
+          customer: who,
+          service: localize(l, r.service.name, r.service.nameAr, r.service.nameCkb),
+          pending,
+        }),
+    });
+  } catch (err) {
+    logger.error({ err }, "barber new-reservation notify failed");
   }
 }
 

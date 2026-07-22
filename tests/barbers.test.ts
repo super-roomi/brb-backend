@@ -3,6 +3,7 @@ import request from "supertest";
 import { createApp } from "../src/app.js";
 import { prisma } from "../src/lib/prisma.js";
 import { weekdayOfLocalDate } from "../src/lib/time.js";
+import { sendDueReminders } from "../src/services/reminders.js";
 
 const app = createApp();
 
@@ -433,6 +434,151 @@ describe("booking approval workflow", () => {
       .set(auth(barberAToken));
     expect(again.status).toBe(400);
     expect(again.body.error.code).toBe("ALREADY_DECIDED");
+  });
+});
+
+describe("notifications: new booking + reminders", () => {
+  let nShopId: string;
+  let nServiceId: string;
+  let nBarberId: string;
+  let barberToken: string;
+  const barberEmail = "notif.barber@test.dev";
+
+  beforeAll(async () => {
+    const allWeek = Array.from({ length: 7 }, (_, weekday) => ({
+      weekday,
+      openMinute: 9 * 60,
+      closeMinute: 18 * 60,
+    })).filter((h) => h.weekday !== 5);
+    const shop = await prisma.barbershop.create({
+      data: {
+        name: "Notify Cuts",
+        description: "Isolated shop for notification tests.",
+        address: "9 Notify Street",
+        phone: "+9647500000099",
+        cityId,
+        chairCount: 1,
+        isVisible: true,
+        services: { create: [{ name: "Cut", durationMin: 30, price: 10_000 }] },
+        openingHours: { create: allWeek },
+        barbers: { create: [{ name: "Notify Barber", email: barberEmail }] },
+        subscription: {
+          create: {
+            planId,
+            status: "ACTIVE",
+            currentPeriodStart: new Date(),
+            currentPeriodEnd: new Date(Date.now() + 30 * 86_400_000),
+          },
+        },
+      },
+      include: { services: true, barbers: true },
+    });
+    nShopId = shop.id;
+    nServiceId = shop.services[0].id;
+    nBarberId = shop.barbers[0].id;
+    barberToken = await newUser(barberEmail);
+  });
+
+  it("notifies the assigned barber of a new booking request", async () => {
+    const cust = await newUser("notif-cust1@test.dev");
+    const book = await request(app)
+      .post("/api/reservations")
+      .set(auth(cust))
+      .send({ shopId: nShopId, serviceId: nServiceId, date: openDate(), startMinute: 10 * 60, barberId: nBarberId });
+    expect(book.status).toBe(201);
+
+    // The barber notification is fire-and-forget, so poll briefly for it.
+    let found = false;
+    for (let i = 0; i < 40 && !found; i++) {
+      const notifs = await request(app).get("/api/notifications").set(auth(barberToken));
+      found = notifs.body.notifications.some(
+        (n: { type: string }) => n.type === "NEW_RESERVATION",
+      );
+      if (!found) await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(found).toBe(true);
+  });
+
+  it("reminds the customer once when a booking enters the 20-min window", async () => {
+    const cust = await newUser("notif-cust2@test.dev");
+    const custUser = await prisma.user.findUniqueOrThrow({
+      where: { email: "notif-cust2@test.dev" },
+    });
+    // One booking inside the window (should remind) and one far out (must not).
+    const soon = await prisma.reservation.create({
+      data: {
+        userId: custUser.id,
+        shopId: nShopId,
+        serviceId: nServiceId,
+        barberId: nBarberId,
+        price: 10_000,
+        startsAt: new Date(Date.now() + 15 * 60_000),
+        endsAt: new Date(Date.now() + 45 * 60_000),
+        status: "CONFIRMED",
+      },
+    });
+    const later = await prisma.reservation.create({
+      data: {
+        userId: custUser.id,
+        shopId: nShopId,
+        serviceId: nServiceId,
+        barberId: nBarberId,
+        price: 10_000,
+        startsAt: new Date(Date.now() + 3 * 60 * 60_000), // 3h out
+        endsAt: new Date(Date.now() + 3 * 60 * 60_000 + 30 * 60_000),
+        status: "CONFIRMED",
+      },
+    });
+
+    await sendDueReminders();
+
+    const notifs = await request(app).get("/api/notifications").set(auth(cust));
+    const reminders = notifs.body.notifications.filter(
+      (n: { type: string }) => n.type === "BOOKING_REMINDER",
+    );
+    expect(reminders.length).toBe(1);
+    expect(
+      (await prisma.reservation.findUniqueOrThrow({ where: { id: soon.id } })).reminderSentAt,
+    ).not.toBeNull();
+    // The far-out booking was left alone.
+    expect(
+      (await prisma.reservation.findUniqueOrThrow({ where: { id: later.id } })).reminderSentAt,
+    ).toBeNull();
+
+    // A second sweep must not double-remind.
+    await sendDueReminders();
+    const after = await request(app).get("/api/notifications").set(auth(cust));
+    expect(
+      after.body.notifications.filter((n: { type: string }) => n.type === "BOOKING_REMINDER").length,
+    ).toBe(1);
+  });
+
+  it("localizes the notification to the customer's language", async () => {
+    const cust = await newUser("notif-ar@test.dev");
+    // The app registers its device carrying the current language (?lang=ar),
+    // which the backend remembers for later notifications.
+    await request(app)
+      .post("/api/notifications/device")
+      .query({ lang: "ar" })
+      .set(auth(cust))
+      .send({ token: "ar-device-token-xyz", platform: "android" });
+
+    const book = await request(app)
+      .post("/api/reservations")
+      .set(auth(cust))
+      .send({ shopId: nShopId, serviceId: nServiceId, date: openDate(), startMinute: 14 * 60, barberId: nBarberId });
+    expect(book.status).toBe(201);
+
+    const accept = await request(app)
+      .post(`/api/barber/reservations/${book.body.reservation.id}/accept`)
+      .set(auth(barberToken));
+    expect(accept.status).toBe(200);
+
+    const notifs = await request(app).get("/api/notifications").set(auth(cust));
+    const confirmed = notifs.body.notifications.find(
+      (n: { type: string }) => n.type === "BOOKING_ACCEPTED",
+    );
+    expect(confirmed.title).toBe("تم تأكيد الحجز"); // Arabic "Booking confirmed"
   });
 });
 

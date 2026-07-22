@@ -7,6 +7,7 @@ import { validate, parsed } from "../middleware/validate.js";
 import { localDayRangeUtc } from "../lib/time.js";
 import { parseLang, localize } from "../lib/localize.js";
 import { sendPushToUser } from "../lib/push.js";
+import { bookingConfirmed, bookingDeclined } from "../lib/notificationMessages.js";
 
 export const barberRouter = Router();
 barberRouter.use(requireUser);
@@ -61,10 +62,23 @@ barberRouter.patch("/auto-approve", validate(autoApproveSchema), async (req, res
   if (enabled) {
     const pending = await prisma.reservation.findMany({
       where: { barberId: barber.id, status: "PENDING", endsAt: { gte: new Date() } },
-      include: { shop: { select: { name: true } }, service: { select: { name: true } } },
+      include: {
+        shop: { select: { name: true, nameAr: true, nameCkb: true } },
+        service: { select: { name: true, nameAr: true, nameCkb: true } },
+        user: { select: { lang: true } },
+      },
     });
     if (pending.length > 0) {
       const ids = pending.map((r) => r.id);
+      // Each customer may read a different language, so build the copy per row.
+      const msgs = pending.map((r) => {
+        const lang = parseLang(r.user.lang);
+        return bookingConfirmed(lang, {
+          barber: localize(lang, barber.name, barber.nameAr, barber.nameCkb),
+          service: localize(lang, r.service.name, r.service.nameAr, r.service.nameCkb),
+          shop: localize(lang, r.shop.name, r.shop.nameAr, r.shop.nameCkb),
+        });
+      });
       // One transaction instead of N: confirm the whole backlog and write all
       // notifications together. The status:"PENDING" guard means any request
       // cancelled since the fetch is left alone.
@@ -74,21 +88,21 @@ barberRouter.patch("/auto-approve", validate(autoApproveSchema), async (req, res
           data: { status: "CONFIRMED" },
         }),
         prisma.notification.createMany({
-          data: pending.map((r) => ({
+          data: pending.map((r, i) => ({
             userId: r.userId,
             type: "BOOKING_ACCEPTED",
-            title: "Booking confirmed",
-            body: `${barber.name} confirmed your ${r.service.name} at ${r.shop.name}.`,
+            title: msgs[i].title,
+            body: msgs[i].body,
             reservationId: r.id,
           })),
         }),
       ]);
       // Real push per confirmed request (no-op if FCM unconfigured).
-      for (const r of pending) {
-        void sendPushToUser(r.userId, {
-          title: "Booking confirmed",
-          body: `${barber.name} confirmed your ${r.service.name} at ${r.shop.name}.`,
-          data: { type: "BOOKING_ACCEPTED", reservationId: r.id },
+      for (let i = 0; i < pending.length; i++) {
+        void sendPushToUser(pending[i].userId, {
+          title: msgs[i].title,
+          body: msgs[i].body,
+          data: { type: "BOOKING_ACCEPTED", reservationId: pending[i].id },
         });
       }
     }
@@ -314,7 +328,10 @@ async function decideReservation(
 
   const reservation = await prisma.reservation.findUnique({
     where: { id: reservationId },
-    include: { shop: { select: { name: true } }, service: { select: { name: true } } },
+    include: {
+      shop: { select: { name: true, nameAr: true, nameCkb: true } },
+      service: { select: { name: true, nameAr: true, nameCkb: true } },
+    },
   });
   if (!reservation || reservation.barberId !== barber.id) {
     throw ApiError.notFound("Request not found");
@@ -325,10 +342,19 @@ async function decideReservation(
 
   const accepted = action === "accept";
   const status = accepted ? "CONFIRMED" : "DECLINED";
-  const title = accepted ? "Booking confirmed" : "Booking declined";
-  const body = accepted
-    ? `${barber.name} confirmed your ${reservation.service.name} at ${reservation.shop.name}.`
-    : `${barber.name} could not take your ${reservation.service.name} at ${reservation.shop.name}. Please pick another time.`;
+
+  // The customer reads this notification, so localize to their language.
+  const customer = await prisma.user.findUnique({
+    where: { id: reservation.userId },
+    select: { lang: true },
+  });
+  const lang = parseLang(customer?.lang);
+  const names = {
+    barber: localize(lang, barber.name, barber.nameAr, barber.nameCkb),
+    service: localize(lang, reservation.service.name, reservation.service.nameAr, reservation.service.nameCkb),
+    shop: localize(lang, reservation.shop.name, reservation.shop.nameAr, reservation.shop.nameCkb),
+  };
+  const { title, body } = accepted ? bookingConfirmed(lang, names) : bookingDeclined(lang, names);
 
   // Compare-and-swap inside the transaction: the decision only lands if the
   // reservation is still PENDING. If the customer cancelled between our read

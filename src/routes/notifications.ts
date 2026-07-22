@@ -3,6 +3,7 @@ import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
 import { requireUser } from "../middleware/auth.js";
 import { validate, parsed } from "../middleware/validate.js";
+import { parseLang } from "../lib/localize.js";
 
 export const notificationsRouter = Router();
 notificationsRouter.use(requireUser);
@@ -17,11 +18,17 @@ const deviceSchema = z.object({
 // (shared device), it's reassigned to the current user.
 notificationsRouter.post("/device", validate(deviceSchema), async (req, res) => {
   const { token, platform } = parsed<z.infer<typeof deviceSchema>>(req);
+  const userId = req.auth!.userId;
   await prisma.deviceToken.upsert({
     where: { token },
-    create: { userId: req.auth!.userId, token, platform },
-    update: { userId: req.auth!.userId, platform },
+    create: { userId, token, platform },
+    update: { userId, platform },
   });
+  // The device-register request carries the app's current ?lang=; remember it
+  // so notifications sent later (outside the user's request) are localized.
+  await prisma.user
+    .update({ where: { id: userId }, data: { lang: parseLang(req.query.lang) } })
+    .catch(() => {});
   res.json({ ok: true });
 });
 

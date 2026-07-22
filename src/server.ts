@@ -2,10 +2,14 @@ import { createApp } from "./app.js";
 import { env } from "./env.js";
 import { prisma } from "./lib/prisma.js";
 import { logger } from "./lib/logger.js";
+import { startReminderScheduler } from "./services/reminders.js";
 
 const app = createApp();
 
 const server = app.listen(env.port, () => {
+  // Appointment reminders run in-process (Render keeps the web service up); the
+  // reminderSentAt claim keeps it correct even if more than one instance runs.
+  startReminderScheduler();
   logger.info(
     {
       port: env.port,

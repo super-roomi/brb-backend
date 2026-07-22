@@ -34,6 +34,10 @@ model User {
   // so users are matched by this id first, not by address.
   appleId       String?        @unique
   name          String?
+  // Preferred content language (en | ar | ckb), refreshed from the ?lang= the
+  // app sends when it registers its device token. Used to localize push and
+  // in-app notifications, which are sent outside the user's own request.
+  lang          String         @default("en")
   createdAt     DateTime       @default(now())
   reservations  Reservation[]
   reviews       Review[]
@@ -203,11 +207,16 @@ model Reservation {
   // barber) | CANCELLED (by customer). Past CONFIRMED counts as completed.
   // PENDING and CONFIRMED both hold the slot.
   status    String     @default("PENDING")
+  // Set when the ~20-min "your appointment is soon" reminder push has been
+  // sent, so the scheduler never reminds the same booking twice.
+  reminderSentAt DateTime?
   createdAt DateTime   @default(now())
 
   @@index([shopId, startsAt])
   @@index([userId, startsAt])
   @@index([barberId, status, startsAt])
+  // Reminder sweep looks up confirmed, not-yet-reminded, soon-starting rows.
+  @@index([status, reminderSentAt, startsAt])
 }
 
 model Notification {

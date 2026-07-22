@@ -210,6 +210,63 @@ describe("auth: Google OAuth + test-login", () => {
   });
 });
 
+describe("auth: account deletion (guideline 5.1.1(v))", () => {
+  it("rejects deletion without a token", async () => {
+    const res = await request(app).delete("/api/auth/me");
+    expect(res.status).toBe(401);
+  });
+
+  it("deletes the account and every row the user owns", async () => {
+    const login = await request(app)
+      .post("/api/auth/test-login")
+      .send({ email: "delete-me@test.dev", name: "Delete Me" });
+    const token = login.body.accessToken as string;
+    const userId = login.body.user.id as string;
+
+    // Seed a full spread: reservation + review reference User without a
+    // cascade (deleted explicitly), the rest cascade off the user row.
+    const reservation = await prisma.reservation.create({
+      data: {
+        userId,
+        shopId,
+        serviceId,
+        startsAt: new Date(Date.now() + 3 * 86_400_000),
+        endsAt: new Date(Date.now() + 3 * 86_400_000 + 30 * 60_000),
+        status: "CONFIRMED",
+      },
+    });
+    await prisma.review.create({
+      data: { userId, shopId, rating: 5, comment: "Great cut" },
+    });
+    await prisma.notification.create({
+      data: {
+        userId,
+        type: "BOOKING_ACCEPTED",
+        title: "t",
+        body: "b",
+        reservationId: reservation.id,
+      },
+    });
+    await prisma.deviceToken.create({
+      data: { userId, token: "device-token-delete-test", platform: "ios" },
+    });
+
+    const del = await request(app).delete("/api/auth/me").set(auth(token));
+    expect(del.status).toBe(200);
+
+    expect(await prisma.user.findUnique({ where: { id: userId } })).toBeNull();
+    expect(await prisma.reservation.count({ where: { userId } })).toBe(0);
+    expect(await prisma.review.count({ where: { userId } })).toBe(0);
+    expect(await prisma.notification.count({ where: { userId } })).toBe(0);
+    expect(await prisma.deviceToken.count({ where: { userId } })).toBe(0);
+    expect(await prisma.refreshToken.count({ where: { userId } })).toBe(0);
+
+    // The now-orphaned access token can no longer resolve a profile.
+    const me = await request(app).get("/api/auth/me").set(auth(token));
+    expect(me.status).toBe(401);
+  });
+});
+
 describe("catalog", () => {
   it("lists only live shops", async () => {
     const res = await request(app).get("/api/shops").query({ cityId });

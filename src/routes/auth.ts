@@ -156,6 +156,21 @@ authRouter.patch("/me", requireUser, validate(meSchema), async (req, res) => {
   res.json({ user: { id: user.id, email: user.email, name: user.name } });
 });
 
+// Account deletion, required in-app by App Store guideline 5.1.1(v). Removes
+// the user and all their personal data. Reservation and Review reference User
+// without a cascade, so delete those first; deleting the user then cascades
+// its notifications, refresh tokens and device tokens. One transaction so a
+// partial failure can't leave a half-deleted account behind.
+authRouter.delete("/me", requireUser, async (req, res) => {
+  const userId = req.auth!.userId;
+  await prisma.$transaction([
+    prisma.reservation.deleteMany({ where: { userId } }),
+    prisma.review.deleteMany({ where: { userId } }),
+    prisma.user.delete({ where: { id: userId } }),
+  ]);
+  res.json({ ok: true });
+});
+
 // Match order: googleId (stable even if the Google email changes), then email
 // (links rows that predate this Google account, incl. "@phone.migrated" ones
 // once the person's real email is set by an admin), then create.
