@@ -11,6 +11,7 @@ import { isShopLive } from "../services/booking.js";
 import { adminLoginLimiter } from "../middleware/rateLimit.js";
 import { addMonths } from "../lib/time.js";
 import { sendPushToUsers } from "../lib/push.js";
+import { STANDARD_SERVICE } from "../lib/standardService.js";
 import { env } from "../env.js";
 
 export const adminRouter = Router();
@@ -235,14 +236,27 @@ adminRouter.post("/shops", validate(shopBase), async (req, res) => {
         snapchatUrl: emptyToNull(body.snapchatUrl) ?? null,
         isVisible: false, // new shops start hidden until the admin flips them on
         services: {
-          create: body.services.map((s) => ({
-            name: s.name,
-            nameAr: emptyToNull(s.nameAr) ?? null,
-            nameCkb: emptyToNull(s.nameCkb) ?? null,
-            durationMin: s.durationMin,
-            price: s.price,
-            isActive: s.isActive,
-          })),
+          create: [
+            // Every shop carries the standard combo (quick booking preselects
+            // it); the admin's own services follow.
+            {
+              name: STANDARD_SERVICE.name,
+              nameAr: STANDARD_SERVICE.nameAr,
+              nameCkb: STANDARD_SERVICE.nameCkb,
+              durationMin: STANDARD_SERVICE.durationMin,
+              price: STANDARD_SERVICE.price,
+              isActive: true,
+              isStandard: true,
+            },
+            ...body.services.map((s) => ({
+              name: s.name,
+              nameAr: emptyToNull(s.nameAr) ?? null,
+              nameCkb: emptyToNull(s.nameCkb) ?? null,
+              durationMin: s.durationMin,
+              price: s.price,
+              isActive: s.isActive,
+            })),
+          ],
         },
         openingHours: { create: body.openingHours },
         barbers: {
@@ -340,10 +354,11 @@ adminRouter.patch("/shops/:id", validate(shopBase.partial()), async (req, res) =
     }
     if (body.services) {
       // Update by id when given; create otherwise. Services with reservations
-      // are never deleted — deactivate instead.
+      // are never deleted — deactivate instead. The standard combo is never
+      // deactivated even if the payload omits it (quick booking relies on it).
       const keptIds = body.services.filter((s) => s.id).map((s) => s.id!);
       await tx.service.updateMany({
-        where: { shopId: existing.id, id: { notIn: keptIds } },
+        where: { shopId: existing.id, id: { notIn: keptIds }, isStandard: false },
         data: { isActive: false },
       });
       for (const s of body.services) {

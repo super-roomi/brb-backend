@@ -3,8 +3,19 @@
 // review, and one barber login for testing the barber dashboard.
 import { PrismaClient } from "@prisma/client";
 import bcrypt from "bcryptjs";
+import { STANDARD_SERVICE } from "../src/lib/standardService.js";
 
 const prisma = new PrismaClient();
+
+// The standard combo every shop carries (quick booking preselects it).
+const standardServiceCreate = {
+  name: STANDARD_SERVICE.name,
+  nameAr: STANDARD_SERVICE.nameAr,
+  nameCkb: STANDARD_SERVICE.nameCkb,
+  durationMin: STANDARD_SERVICE.durationMin,
+  price: STANDARD_SERVICE.price,
+  isStandard: true,
+};
 
 async function main() {
   const adminEmail = process.env.SEED_ADMIN_EMAIL ?? "admin@barberapp.dev";
@@ -62,7 +73,6 @@ async function main() {
         { name: "Classic Haircut", durationMin: 30, price: 15_000 },
         { name: "Beard Trim & Shape", durationMin: 20, price: 8_000 },
         { name: "Hot Towel Shave", durationMin: 30, price: 12_000 },
-        { name: "Haircut + Beard Combo", durationMin: 45, price: 20_000 },
       ],
       barbers: [
         { name: "Aland Kareem", email: "aland.kareem@barberapp.dev" },
@@ -141,7 +151,8 @@ async function main() {
         facebookUrl: spec.facebookUrl ?? null,
         tiktokUrl: spec.tiktokUrl ?? null,
         snapchatUrl: spec.snapchatUrl ?? null,
-        services: { create: spec.services },
+        // Every shop carries the standard combo alongside its own services.
+        services: { create: [...spec.services, standardServiceCreate] },
         openingHours: { create: fullWeek },
         barbers: { create: spec.barbers },
         subscription: {

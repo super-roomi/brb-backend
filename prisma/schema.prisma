@@ -147,6 +147,10 @@ model Service {
   durationMin  Int
   price        Int
   isActive     Boolean       @default(true)
+  // The "Haircut & Beard Trim" combo every shop carries. Auto-created with each
+  // shop and shielded from deletion so quick booking always has a service to
+  // preselect. Exactly one per shop. Admins may still rename/reprice it.
+  isStandard   Boolean       @default(false)
   reservations Reservation[]
 
   @@index([shopId])

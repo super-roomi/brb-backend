@@ -502,6 +502,18 @@ describe("admin", () => {
     expect(created.status).toBe(201);
     const newShopId = created.body.shop.id;
 
+    // Every shop is auto-given the standard "Haircut & Beard Trim" combo on
+    // top of the admin's own services, and it's flagged isStandard.
+    const detail = await request(app)
+      .get(`/api/admin/shops/${newShopId}`)
+      .set(auth(adminToken));
+    expect(detail.status).toBe(200);
+    const svcs = detail.body.shop.services as { name: string; isStandard: boolean }[];
+    const standard = svcs.filter((s) => s.isStandard);
+    expect(standard).toHaveLength(1);
+    expect(standard[0].name).toBe("Haircut & Beard Trim");
+    expect(svcs.some((s) => s.name === "Cut" && !s.isStandard)).toBe(true);
+
     // Hidden + no subscription → not in the app.
     let list = await request(app).get("/api/shops").query({ cityId });
     let names = list.body.shops.map((s: { name: string }) => s.name);
@@ -531,6 +543,40 @@ describe("admin", () => {
     list = await request(app).get("/api/shops").query({ cityId });
     names = list.body.shops.map((s: { name: string }) => s.name);
     expect(names).not.toContain("Admin Made Shop");
+  });
+
+  it("keeps the standard service active when an edit omits it", async () => {
+    const created = await request(app)
+      .post("/api/admin/shops")
+      .set(auth(adminToken))
+      .send({
+        name: "Edit Guard Shop",
+        description: "Ensures the standard combo survives edits that omit it.",
+        address: "9 Test Street",
+        phone: "+9647500000009",
+        cityId,
+        chairCount: 1,
+        openingHours: [{ weekday: 1, openMinute: 540, closeMinute: 1080 }],
+        services: [{ name: "Fade", durationMin: 30, price: 10_000, isActive: true }],
+      });
+    expect(created.status).toBe(201);
+    const id = created.body.shop.id;
+
+    // Edit with a brand-new service list that does NOT include the standard
+    // combo. It must not be deactivated.
+    const patched = await request(app)
+      .patch(`/api/admin/shops/${id}`)
+      .set(auth(adminToken))
+      .send({ services: [{ name: "New Service", durationMin: 20, price: 5_000, isActive: true }] });
+    expect(patched.status).toBe(200);
+
+    const detail = await request(app)
+      .get(`/api/admin/shops/${id}`)
+      .set(auth(adminToken));
+    const standard = (detail.body.shop.services as { isStandard: boolean; isActive: boolean }[])
+      .filter((s) => s.isStandard);
+    expect(standard).toHaveLength(1);
+    expect(standard[0].isActive).toBe(true);
   });
 
   it("manages plans", async () => {

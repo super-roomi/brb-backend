@@ -155,6 +155,9 @@ catalogRouter.get("/shops/:id", async (req, res) => {
         name: localize(lang, s.name, s.nameAr, s.nameCkb),
         durationMin: s.durationMin,
         price: s.price,
+        // Flags the standard "Haircut & Beard Trim" combo the app's quick
+        // booking preselects.
+        isStandard: s.isStandard,
       })),
       barbers: shop.barbers.map((b) => ({
         id: b.id,
