@@ -9,8 +9,9 @@
   },
   "scripts": {
     "dev": "tsx watch src/server.ts | pino-pretty",
-    "start": "prisma migrate deploy && node dist/server.js",
+    "start": "node dist/server.js",
     "build": "prisma generate && tsc",
+    "db:deploy": "prisma migrate deploy",
     "db:migrate": "prisma migrate dev",
     "db:seed": "tsx prisma/seed.ts",
     "db:reset": "prisma migrate reset --force",

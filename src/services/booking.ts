@@ -114,7 +114,20 @@ export async function createReservation(input: {
       void notifyBarberOfNewReservation(reservation);
       return reservation;
     } catch (e) {
-      if (isRetryableTxError(e) && attempt < MAX_BOOKING_RETRIES) continue;
+      if (isRetryableTxError(e)) {
+        if (attempt < MAX_BOOKING_RETRIES) continue;
+        // Out of retries. This is contention, not a server fault: several
+        // people are racing for the same slot and we keep losing the
+        // serialization race. Reporting it as a 500 (which is what falling
+        // through to `throw e` did) showed "Something went wrong" during
+        // exactly the traffic spike where "that slot was taken" is both true
+        // and actionable — and the app has no handler for a 500.
+        logger.warn(
+          { shopId, serviceId, startsAt, barberId },
+          "booking gave up after repeated serialization failures",
+        );
+        throw ApiError.conflict("That time was just taken. Pick another slot.", "SLOT_TAKEN");
+      }
       if (isOverlapExclusionViolation(e)) {
         throw ApiError.conflict("That time was just taken. Pick another slot.", "SLOT_TAKEN");
       }
@@ -269,7 +282,14 @@ function runBookingTx(args: {
         include: reservationInclude,
       });
     },
-    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    {
+      isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+      // Bound both halves so a booking burst degrades into fast 409s instead of
+      // requests piling up on a pool that never frees. maxWait caps queuing for
+      // a connection; timeout caps the transaction itself.
+      maxWait: 5_000,
+      timeout: 10_000,
+    },
   );
 }
 

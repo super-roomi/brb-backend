@@ -2,6 +2,7 @@ import jwt, { type JwtPayload } from "jsonwebtoken";
 import { createPublicKey, type KeyObject } from "node:crypto";
 import { env } from "../env.js";
 import { ApiError } from "./errors.js";
+import { logger } from "./logger.js";
 
 // Verified identity extracted from an Apple identity token. Note the name is
 // NOT in the token: Apple returns it to the client once, on the first
@@ -29,12 +30,41 @@ interface AppleJwk {
 let cachedKeys: { keys: AppleJwk[]; fetchedAt: number } | null = null;
 const KEYS_TTL_MS = 60 * 60 * 1000;
 
+// Apple's JWKS endpoint is on the login path. Cap the fetch so an unreachable
+// Apple stalls one request briefly rather than holding a connection for the
+// full server request timeout.
+const KEYS_FETCH_TIMEOUT_MS = 8_000;
+
 async function fetchAppleKeys(force = false): Promise<AppleJwk[]> {
   if (!force && cachedKeys && Date.now() - cachedKeys.fetchedAt < KEYS_TTL_MS) {
     return cachedKeys.keys;
   }
-  const res = await fetch(APPLE_KEYS_URL);
-  if (!res.ok) throw new Error(`Apple JWKS fetch failed: ${res.status}`);
+  let res: Response;
+  try {
+    res = await fetch(APPLE_KEYS_URL, {
+      signal: AbortSignal.timeout(KEYS_FETCH_TIMEOUT_MS),
+    });
+  } catch (err) {
+    // Serve a stale cache rather than failing every sign-in during an Apple
+    // blip: these keys rotate on the order of months, so an hour-old copy is
+    // still overwhelmingly likely to verify the token in hand.
+    if (cachedKeys) {
+      logger.warn({ err }, "Apple JWKS fetch failed — using cached keys");
+      return cachedKeys.keys;
+    }
+    throw new ApiError(
+      503,
+      "APPLE_UNAVAILABLE",
+      "Could not reach Apple to verify your sign-in. Try again.",
+    );
+  }
+  if (!res.ok) {
+    if (cachedKeys) {
+      logger.warn({ status: res.status }, "Apple JWKS returned an error — using cached keys");
+      return cachedKeys.keys;
+    }
+    throw new Error(`Apple JWKS fetch failed: ${res.status}`);
+  }
   const body = (await res.json()) as { keys: AppleJwk[] };
   cachedKeys = { keys: body.keys, fetchedAt: Date.now() };
   return body.keys;

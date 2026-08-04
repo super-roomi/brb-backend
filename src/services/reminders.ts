@@ -67,3 +67,10 @@ export function startReminderScheduler(): void {
   timer.unref?.(); // don't keep the process alive on shutdown
   void sendDueReminders(); // sweep once at boot instead of waiting a minute
 }
+
+// Stop the sweep on shutdown so a redeploy doesn't start a fresh batch of
+// notification writes while the process is already draining.
+export function stopReminderScheduler(): void {
+  if (timer) clearInterval(timer);
+  timer = null;
+}

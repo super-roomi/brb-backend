@@ -64,38 +64,44 @@ authRouter.post(
   },
 );
 
-// Developer shortcut while Google credentials don't exist yet: logs in as a
-// well-known test user with no external dependency. Hidden (404) in
-// production unless ENABLE_TEST_LOGIN=true is set on purpose.
+// Developer shortcut with no external dependency: signs in as any email with no
+// credential at all.
+//
+// This is account takeover for every user on the platform — including barbers,
+// whose dashboard unlocks purely on an email match — so it is registered ONLY
+// outside production. There is deliberately no environment flag to switch it
+// on: a flag makes "production has password-less login for every account" one
+// mistyped dashboard value away, and that is not a risk worth the convenience.
+// A staging environment that wants it should run with NODE_ENV != production.
 const testLoginSchema = z.object({
   email: z.string().trim().toLowerCase().email().max(120).optional(),
   name: z.string().trim().min(2).max(60).optional(),
 });
 
-authRouter.post(
-  "/test-login",
-  authLimiter,
-  validate(testLoginSchema),
-  async (req, res) => {
-    if (!env.testLoginEnabled) throw ApiError.notFound();
+if (env.testLoginEnabled) {
+  authRouter.post(
+    "/test-login",
+    authLimiter,
+    validate(testLoginSchema),
+    async (req, res) => {
+      const body = parsed<z.infer<typeof testLoginSchema>>(req);
+      const email = body.email ?? TEST_USER_EMAIL;
+      const existing = await prisma.user.findUnique({ where: { email } });
+      const user =
+        existing ??
+        (await prisma.user.create({
+          data: { email, name: body.name ?? "Test User" },
+        }));
 
-    const body = parsed<z.infer<typeof testLoginSchema>>(req);
-    const email = body.email ?? TEST_USER_EMAIL;
-    const existing = await prisma.user.findUnique({ where: { email } });
-    const user =
-      existing ??
-      (await prisma.user.create({
-        data: { email, name: body.name ?? "Test User" },
-      }));
-
-    const tokens = await issueTokens(user.id);
-    res.json({
-      ...tokens,
-      isNewUser: !existing,
-      user: { id: user.id, email: user.email, name: user.name },
-    });
-  },
-);
+      const tokens = await issueTokens(user.id);
+      res.json({
+        ...tokens,
+        isNewUser: !existing,
+        user: { id: user.id, email: user.email, name: user.name },
+      });
+    },
+  );
+}
 
 const refreshSchema = z.object({ refreshToken: z.string().min(20) });
 
@@ -156,18 +162,75 @@ authRouter.patch("/me", requireUser, validate(meSchema), async (req, res) => {
   res.json({ user: { id: user.id, email: user.email, name: user.name } });
 });
 
-// Account deletion, required in-app by App Store guideline 5.1.1(v). Removes
-// the user and all their personal data. Reservation and Review reference User
-// without a cascade, so delete those first; deleting the user then cascades
-// its notifications, refresh tokens and device tokens. One transaction so a
-// partial failure can't leave a half-deleted account behind.
+// Account deletion, required in-app by App Store guideline 5.1.1(v) and
+// promised by the privacy policy ("removes your bookings and reviews").
+//
+// Removing those rows has two side effects on OTHER people's data that the
+// first version of this missed, both fixed here inside the same transaction:
+//
+//   1. Barber earnings. /barber/stats sums `price` over Reservation rows, so
+//      deleting a customer's history silently reduced their barber's lifetime
+//      earnings and cut count. Completed appointments are rolled into the
+//      barber's aggregate archived* counters first — customer-free numbers, so
+//      the deletion promise still holds.
+//   2. Shop ratings. Barbershop.ratingAvg/ratingCount are denormalized from
+//      Review, and nothing recomputed them when a review vanished, so a shop's
+//      displayed rating drifted permanently away from its actual reviews.
+//
+// Deleting the user then cascades its notifications, refresh tokens and device
+// tokens. One transaction so a partial failure can't leave a half-deleted
+// account behind.
 authRouter.delete("/me", requireUser, async (req, res) => {
   const userId = req.auth!.userId;
-  await prisma.$transaction([
-    prisma.reservation.deleteMany({ where: { userId } }),
-    prisma.review.deleteMany({ where: { userId } }),
-    prisma.user.delete({ where: { id: userId } }),
-  ]);
+  const now = new Date();
+
+  // Completed = confirmed and already finished; that is exactly what
+  // /barber/stats counts as a cut.
+  const completed = await prisma.reservation.groupBy({
+    by: ["barberId"],
+    where: { userId, status: "CONFIRMED", endsAt: { lt: now }, barberId: { not: null } },
+    _count: { _all: true },
+    _sum: { price: true },
+  });
+  // Shops this person reviewed, so their aggregates can be rebuilt after.
+  const reviewed = await prisma.review.findMany({
+    where: { userId },
+    select: { shopId: true },
+  });
+  const reviewedShopIds = [...new Set(reviewed.map((r) => r.shopId))];
+
+  await prisma.$transaction(async (tx) => {
+    for (const row of completed) {
+      await tx.barber.update({
+        where: { id: row.barberId! },
+        data: {
+          archivedCuts: { increment: row._count._all },
+          archivedEarnings: { increment: row._sum.price ?? 0 },
+        },
+      });
+    }
+
+    await tx.reservation.deleteMany({ where: { userId } });
+    await tx.review.deleteMany({ where: { userId } });
+    await tx.user.delete({ where: { id: userId } });
+
+    // Rebuild each affected shop's denormalized rating from what's left.
+    for (const shopId of reviewedShopIds) {
+      const agg = await tx.review.aggregate({
+        where: { shopId },
+        _avg: { rating: true },
+        _count: true,
+      });
+      await tx.barbershop.update({
+        where: { id: shopId },
+        data: {
+          ratingAvg: Math.round((agg._avg.rating ?? 0) * 10) / 10,
+          ratingCount: agg._count,
+        },
+      });
+    }
+  });
+
   res.json({ ok: true });
 });
 

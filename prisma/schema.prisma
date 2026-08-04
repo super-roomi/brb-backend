@@ -79,6 +79,10 @@ model RefreshToken {
   createdAt DateTime  @default(now())
 
   @@index([userId])
+  // Nightly retention sweep deletes rows past their expiry (see
+  // services/maintenance.ts) — without this the table grows forever, roughly
+  // one row per token refresh per device.
+  @@index([expiresAt])
 }
 
 model Barbershop {
@@ -134,6 +138,10 @@ model Barbershop {
   subscription     Subscription?
 
   @@index([cityId, isVisible])
+  // Supports the bounding-box prefilter in GET /api/shops/nearby. A partial
+  // index would be tighter, but Prisma can't express one — the raw migration
+  // adds a `WHERE latitude IS NOT NULL` variant alongside it.
+  @@index([latitude, longitude])
 }
 
 model Service {
@@ -183,6 +191,14 @@ model Barber {
   // When true, incoming booking requests for this barber are confirmed
   // automatically instead of waiting in the requests queue.
   autoApprove  Boolean       @default(false)
+  // Lifetime totals carried over from appointments whose Reservation rows were
+  // removed by a customer deleting their account. The privacy policy promises
+  // deletion removes that customer's bookings, but the barber's earnings are
+  // the BARBER's business record — without this, one customer pressing Delete
+  // Account silently reduced someone else's lifetime earnings and cut count.
+  // Aggregate-only and customer-free, so nothing personal survives here.
+  archivedCuts     Int       @default(0)
+  archivedEarnings Int       @default(0)
   createdAt    DateTime      @default(now())
   reservations Reservation[]
 
@@ -236,6 +252,10 @@ model Notification {
   createdAt     DateTime    @default(now())
 
   @@index([userId, createdAt])
+  // Retention sweep deletes read notifications past the cutoff. The feed only
+  // ever shows the newest 50, so old rows are pure storage cost — and the
+  // Barber-of-the-Week broadcast writes one per user per run.
+  @@index([createdAt])
 }
 
 model Review {
@@ -265,6 +285,32 @@ model Plan {
   isActive      Boolean        @default(true)
   createdAt     DateTime       @default(now())
   subscriptions Subscription[]
+}
+
+// Append-only trail of every state-changing admin action. Admin writes are
+// billing events (subscriptions, plan pricing, shop visibility, featured
+// placement), so "who changed this and when" has to be answerable after the
+// fact. Never updated or deleted by application code; the retention sweep
+// trims entries older than AUDIT_RETENTION_DAYS.
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String
+  // Denormalized: the trail must stay readable even if the AdminUser row is
+  // later removed or renamed.
+  actorEmail String
+  // Dotted verb, e.g. "shop.visibility" | "subscription.assign" | "plan.delete".
+  action     String
+  targetType String
+  targetId   String?
+  // JSON-encoded summary of what changed. A string (not a Json column) keeps
+  // the shape opaque and avoids indexing something we only ever read by eye.
+  detail     String?
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([actorId, createdAt])
+  @@index([targetType, targetId, createdAt])
 }
 
 model Subscription {

@@ -1,6 +1,12 @@
 import { OAuth2Client } from "google-auth-library";
 import { env } from "../env.js";
 import { ApiError } from "./errors.js";
+import { withTimeout } from "./timeout.js";
+
+// Token verification fetches Google's signing certs, so it is a network call.
+// Uncapped, a stalled fetch holds the request (and its rate-limit slot) until
+// the server-wide 30s timeout.
+const VERIFY_TIMEOUT_MS = 8_000;
 
 // Verified identity extracted from a Google ID token.
 export interface GoogleIdentity {
@@ -24,12 +30,23 @@ export async function verifyGoogleIdToken(idToken: string): Promise<GoogleIdenti
 
   let payload;
   try {
-    const ticket = await client.verifyIdToken({
-      idToken,
-      audience: env.googleClientIds,
-    });
+    const ticket = await withTimeout(
+      client.verifyIdToken({ idToken, audience: env.googleClientIds }),
+      VERIFY_TIMEOUT_MS,
+      "google.verifyIdToken",
+    );
     payload = ticket.getPayload();
-  } catch {
+  } catch (err) {
+    // A timeout is us failing, not the caller's token being bad. Say so, so a
+    // Google outage surfaces as a retryable 503 in the app instead of bouncing
+    // the user to the login screen with "sign-in failed".
+    if (err instanceof Error && err.name === "TimeoutError") {
+      throw new ApiError(
+        503,
+        "GOOGLE_UNAVAILABLE",
+        "Could not reach Google to verify your sign-in. Try again.",
+      );
+    }
     throw ApiError.unauthorized("Google sign-in failed", "GOOGLE_TOKEN_INVALID");
   }
 

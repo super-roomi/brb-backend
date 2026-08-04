@@ -97,6 +97,10 @@ catalogRouter.get("/shops/of-the-week", async (req, res) => {
     orderBy: { botwRank: "asc" },
     take: 3,
   });
+  // This is the endpoint a Barber-of-the-Week broadcast drives every recipient
+  // straight at, so it is the one that most needs to absorb a spike. The
+  // selection changes weekly, so a short shared cache costs nothing.
+  res.set("Cache-Control", "public, max-age=300");
   res.json({
     shops: shops.map((s) => ({
       id: s.id,
@@ -111,6 +115,91 @@ catalogRouter.get("/shops/of-the-week", async (req, res) => {
     })),
   });
 });
+
+// Nearest live shops to a coordinate. Registered before "/shops/:id" so
+// "nearby" isn't matched as an id.
+//
+// The app used to fetch the first page of shops and measure distance on-device.
+// That silently stops being correct the moment more than `pageSize` shops are
+// live — the "nearest 3" would only ever be the nearest 3 *of the highest-tier
+// page*, not of the city — and it shipped the whole list on every quick-book
+// open. Distance now belongs to the database.
+const nearbySchema = z.object({
+  lat: z.coerce.number().min(-90).max(90),
+  lng: z.coerce.number().min(-180).max(180),
+  radiusKm: z.coerce.number().min(0.1).max(100).default(3),
+  limit: z.coerce.number().int().min(1).max(20).default(3),
+});
+
+// Latitude is ~111.32 km per degree everywhere; longitude shrinks by cos(lat).
+const KM_PER_DEG_LAT = 111.32;
+const EARTH_RADIUS_KM = 6371;
+
+catalogRouter.get("/shops/nearby", validate(nearbySchema, "query"), async (req, res) => {
+  const q = parsed<z.infer<typeof nearbySchema>>(req);
+  const lang = parseLang(req.query.lang);
+
+  // Bounding box first: it is a plain indexed range scan (see the geo index in
+  // the 20260726 migration), and it discards almost everything before the
+  // trigonometry runs. The box is a superset of the circle, so the exact
+  // haversine filter below still decides membership.
+  const latDelta = q.radiusKm / KM_PER_DEG_LAT;
+  const cosLat = Math.cos((q.lat * Math.PI) / 180);
+  // Guard the poles, where cos(lat) collapses and the longitude span explodes.
+  const lngDelta =
+    Math.abs(cosLat) < 0.01 ? 180 : q.radiusKm / (KM_PER_DEG_LAT * Math.abs(cosLat));
+
+  const candidates = await prisma.barbershop.findMany({
+    where: {
+      ...liveShopWhere(),
+      latitude: { not: null, gte: q.lat - latDelta, lte: q.lat + latDelta },
+      longitude: { not: null, gte: q.lng - lngDelta, lte: q.lng + lngDelta },
+    },
+    include: {
+      city: { select: { id: true, name: true } },
+      subscription: { select: { plan: { select: { isFeaturedTier: true, monthlyPrice: true } } } },
+    },
+    // Hard cap: a huge radius must not turn into an unbounded scan. Well above
+    // any plausible number of shops inside a city-sized radius.
+    take: 200,
+  });
+
+  const withDistance = candidates
+    .map((s) => ({ shop: s, meters: haversineMeters(q.lat, q.lng, s.latitude!, s.longitude!) }))
+    .filter((c) => c.meters <= q.radiusKm * 1000)
+    .sort((a, b) => a.meters - b.meters)
+    .slice(0, q.limit);
+
+  res.json({
+    shops: withDistance.map(({ shop: s, meters }) => ({
+      id: s.id,
+      name: localize(lang, s.name, s.nameAr, s.nameCkb),
+      description: localize(lang, s.description, s.descriptionAr, s.descriptionCkb),
+      address: s.address,
+      imageUrl: s.imageUrl,
+      city: s.city,
+      latitude: s.latitude,
+      longitude: s.longitude,
+      ratingAvg: s.ratingAvg,
+      ratingCount: s.ratingCount,
+      isFeatured: s.subscription?.plan.isFeaturedTier ?? false,
+      tierRank: s.subscription?.plan.monthlyPrice ?? 0,
+      // Server-measured, so the client no longer needs every shop's coordinates
+      // to rank them.
+      distanceMeters: Math.round(meters),
+    })),
+  });
+});
+
+function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * EARTH_RADIUS_KM * 1000 * Math.asin(Math.min(1, Math.sqrt(a)));
+}
 
 catalogRouter.get("/shops/:id", async (req, res) => {
   const shop = await prisma.barbershop.findUnique({

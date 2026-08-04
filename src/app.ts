@@ -16,7 +16,36 @@ import { notificationsRouter } from "./routes/notifications.js";
 import { adminRouter } from "./routes/admin.js";
 import { errorHandler, notFoundHandler } from "./middleware/error.js";
 import { generalLimiter } from "./middleware/rateLimit.js";
-import { prisma } from "./lib/prisma.js";
+import { pingDatabase } from "./lib/prisma.js";
+
+// Flipped by the shutdown path. While true, readiness reports 503 so the load
+// balancer stops sending new requests BEFORE the process stops accepting them —
+// without this, every redeploy drops a handful of requests into a socket that
+// is already closing.
+let draining = false;
+
+export function beginDraining(): void {
+  draining = true;
+}
+
+export function isDraining(): boolean {
+  return draining;
+}
+
+// Readiness runs on every load-balancer probe, so it must not become its own
+// load. Cache the DB check briefly: a database that just answered is
+// overwhelmingly likely to still be up 2 seconds later, and this keeps a burst
+// of probes from opening a connection each.
+const READY_CACHE_MS = 2_000;
+let lastReady = { at: 0, ok: false };
+
+async function databaseReady(): Promise<boolean> {
+  const now = Date.now();
+  if (now - lastReady.at < READY_CACHE_MS) return lastReady.ok;
+  const ok = await pingDatabase();
+  lastReady = { at: now, ok };
+  return ok;
+}
 
 export function createApp() {
   const app = express();
@@ -43,18 +72,26 @@ export function createApp() {
   app.use(express.json({ limit: "256kb" }));
   app.use(generalLimiter);
 
-  // Liveness: the process is up. Cheap, never touches the DB.
+  // Liveness: the process is up and the event loop is turning. Cheap, never
+  // touches the DB — a liveness probe that depends on the database will
+  // restart a perfectly healthy process during a database blip, turning a
+  // partial outage into a crash loop.
   app.get("/api/health", (_req, res) => res.json({ ok: true }));
-  // Readiness: the process can actually serve traffic (DB reachable). Load
-  // balancers / orchestrators should gate on this one, not /health.
+
+  // Readiness: this instance should receive traffic right now. Gates on both
+  // the drain flag and the database.
   app.get("/api/health/ready", async (_req, res) => {
-    try {
-      await prisma.$queryRaw`SELECT 1`;
-      res.json({ ok: true });
-    } catch {
-      res.status(503).json({ error: { code: "NOT_READY", message: "Database unavailable" } });
+    if (draining) {
+      res.status(503).json({ error: { code: "DRAINING", message: "Shutting down" } });
+      return;
     }
+    if (await databaseReady()) {
+      res.json({ ok: true });
+      return;
+    }
+    res.status(503).json({ error: { code: "NOT_READY", message: "Database unavailable" } });
   });
+
   app.use("/api/auth", authRouter);
   app.use("/api", catalogRouter);
   app.use("/api/reservations", reservationsRouter);

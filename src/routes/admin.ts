@@ -4,15 +4,15 @@ import bcrypt from "bcryptjs";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { ApiError } from "../lib/errors.js";
-import { signAccessToken } from "../lib/jwt.js";
+import { signAdminToken } from "../lib/jwt.js";
 import { requireAdmin } from "../middleware/auth.js";
 import { validate, parsed } from "../middleware/validate.js";
 import { isShopLive } from "../services/booking.js";
 import { adminLoginLimiter } from "../middleware/rateLimit.js";
 import { addMonths } from "../lib/time.js";
-import { sendPushToUsers } from "../lib/push.js";
+import { audit } from "../lib/audit.js";
+import { broadcastToAllUsers, isBroadcastRunning } from "../services/broadcast.js";
 import { STANDARD_SERVICE } from "../lib/standardService.js";
-import { env } from "../env.js";
 
 export const adminRouter = Router();
 
@@ -25,8 +25,10 @@ adminRouter.post("/login", adminLoginLimiter, validate(loginSchema), async (req,
   if (!admin || !(await bcrypt.compare(password, admin.passwordHash))) {
     throw ApiError.unauthorized("Invalid credentials", "BAD_CREDENTIALS");
   }
+  // Signed with the dedicated admin secret and audience (see lib/jwt.ts), so a
+  // customer token can never satisfy requireAdmin and vice versa.
   res.json({
-    accessToken: signAccessToken({ sub: admin.id, role: "admin" }, env.adminAccessTtl),
+    accessToken: signAdminToken(admin.id),
     admin: { id: admin.id, email: admin.email, name: admin.name },
   });
 });
@@ -68,6 +70,7 @@ adminRouter.post("/cities", validate(citySchema), async (req, res) => {
   const { name } = parsed<z.infer<typeof citySchema>>(req);
   const slug = name.toLowerCase().replace(/\s+/g, "-");
   const city = await prisma.city.create({ data: { name, slug } });
+  audit(req, { action: "city.create", targetType: "City", targetId: city.id, detail: { name } });
   res.status(201).json({ city });
 });
 
@@ -154,16 +157,34 @@ const shopBase = z.object({
 const emptyToNull = (v: string | null | undefined) =>
   v === undefined ? undefined : v === "" ? null : v;
 
-adminRouter.get("/shops", async (_req, res) => {
-  const shops = await prisma.barbershop.findMany({
-    include: {
-      city: { select: { id: true, name: true } },
-      subscription: { include: { plan: { select: { id: true, name: true, isFeaturedTier: true } } } },
-      _count: { select: { reservations: true, reviews: true } },
-    },
-    orderBy: { createdAt: "desc" },
-  });
+// Paginated, but defaults to a page large enough that the existing panel (which
+// renders the whole list and filters client-side) keeps working unchanged.
+// `pageSize=all` is deliberately absent: an unbounded scan with two _count
+// subqueries per row is exactly what stops being survivable as the platform grows.
+const shopListSchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(200).default(200),
+});
+
+adminRouter.get("/shops", validate(shopListSchema, "query"), async (req, res) => {
+  const q = parsed<z.infer<typeof shopListSchema>>(req);
+  const [total, shops] = await Promise.all([
+    prisma.barbershop.count(),
+    prisma.barbershop.findMany({
+      include: {
+        city: { select: { id: true, name: true } },
+        subscription: { include: { plan: { select: { id: true, name: true, isFeaturedTier: true } } } },
+        _count: { select: { reservations: true, reviews: true } },
+      },
+      orderBy: { createdAt: "desc" },
+      skip: (q.page - 1) * q.pageSize,
+      take: q.pageSize,
+    }),
+  ]);
   res.json({
+    page: q.page,
+    pageSize: q.pageSize,
+    total,
     shops: shops.map((s) => ({
       id: s.id,
       name: s.name,
@@ -271,6 +292,12 @@ adminRouter.post("/shops", validate(shopBase), async (req, res) => {
       },
     })
     .catch(rethrowBarberEmailConflict);
+  audit(req, {
+    action: "shop.create",
+    targetType: "Barbershop",
+    targetId: shop.id,
+    detail: { name: body.name, cityId: body.cityId },
+  });
   res.status(201).json({ shop: { id: shop.id } });
 });
 
@@ -427,6 +454,14 @@ adminRouter.patch("/shops/:id", validate(shopBase.partial()), async (req, res) =
       }
     }
   }).catch(rethrowBarberEmailConflict);
+  audit(req, {
+    action: "shop.update",
+    targetType: "Barbershop",
+    targetId: existing.id,
+    // Field names only — the full payload would bloat the trail and copy
+    // customer-adjacent content into it for no investigative benefit.
+    detail: { fields: Object.keys(body) },
+  });
   res.json({ ok: true });
 });
 
@@ -438,6 +473,12 @@ adminRouter.patch("/shops/:id/visibility", validate(visibilitySchema), async (re
     .update({ where: { id: req.params.id }, data: { isVisible } })
     .catch(() => null);
   if (!shop) throw ApiError.notFound("Barbershop not found");
+  audit(req, {
+    action: "shop.visibility",
+    targetType: "Barbershop",
+    targetId: shop.id,
+    detail: { isVisible },
+  });
   res.json({ id: shop.id, isVisible: shop.isVisible });
 });
 
@@ -470,15 +511,26 @@ const planSchema = z.object({
 });
 
 adminRouter.post("/plans", validate(planSchema), async (req, res) => {
-  const plan = await prisma.plan.create({ data: parsed<z.infer<typeof planSchema>>(req) });
+  const body = parsed<z.infer<typeof planSchema>>(req);
+  const plan = await prisma.plan.create({ data: body });
+  audit(req, {
+    action: "plan.create",
+    targetType: "Plan",
+    targetId: plan.id,
+    detail: { name: body.name, monthlyPrice: body.monthlyPrice },
+  });
   res.status(201).json({ plan });
 });
 
 adminRouter.patch("/plans/:id", validate(planSchema.partial()), async (req, res) => {
+  const body = parsed<z.infer<ReturnType<typeof planSchema.partial>>>(req);
   const plan = await prisma.plan
-    .update({ where: { id: req.params.id }, data: parsed<z.infer<ReturnType<typeof planSchema.partial>>>(req) })
+    .update({ where: { id: req.params.id }, data: body })
     .catch(() => null);
   if (!plan) throw ApiError.notFound("Plan not found");
+  // Pricing changes are the ones most likely to be questioned later, so record
+  // the new values rather than just the field names.
+  audit(req, { action: "plan.update", targetType: "Plan", targetId: plan.id, detail: body });
   res.json({ plan });
 });
 
@@ -494,6 +546,12 @@ adminRouter.delete("/plans/:id", async (req, res) => {
   }
   const deleted = await prisma.plan.delete({ where: { id: req.params.id } }).catch(() => null);
   if (!deleted) throw ApiError.notFound("Plan not found");
+  audit(req, {
+    action: "plan.delete",
+    targetType: "Plan",
+    targetId: deleted.id,
+    detail: { name: deleted.name, monthlyPrice: deleted.monthlyPrice },
+  });
   res.json({ ok: true });
 });
 
@@ -562,8 +620,18 @@ adminRouter.post("/barber-of-week", validate(botwSchema), async (req, res) => {
     }
   }
 
-  const users = shopIds.length > 0 ? await prisma.user.findMany({ select: { id: true } }) : [];
+  // Refuse to start a second rollout while one is still going out: it would
+  // double every user's feed entry and stack two push waves.
+  if (shopIds.length > 0 && isBroadcastRunning()) {
+    throw ApiError.conflict(
+      "The previous Barber of the Week announcement is still being delivered. Try again shortly.",
+      "BROADCAST_IN_PROGRESS",
+    );
+  }
 
+  // The rank flip is small and immediate — only the picks themselves.
+  // Announcing them used to happen in this same transaction, which held it open
+  // across the entire user table.
   await prisma.$transaction([
     // Clear the previous week's picks.
     prisma.barbershop.updateMany({
@@ -574,35 +642,29 @@ adminRouter.post("/barber-of-week", validate(botwSchema), async (req, res) => {
     ...shopIds.map((id, i) =>
       prisma.barbershop.update({ where: { id }, data: { botwRank: i + 1, botwSelectedAt: now } }),
     ),
-    // In-app feed notification for every user (real APNs/FCM push would layer
-    // onto these same records).
-    ...(users.length > 0
-      ? [
-          prisma.notification.createMany({
-            data: users.map((u) => ({
-              userId: u.id,
-              type: "BARBER_OF_WEEK",
-              title: "Barber of the Week",
-              body: "This week's top barbershops are in — see them at the top of the app.",
-            })),
-          }),
-        ]
-      : []),
   ]);
 
-  // Real push to everyone (no-op if FCM unconfigured), on top of the feed rows.
-  if (users.length > 0) {
-    void sendPushToUsers(
-      users.map((u) => u.id),
-      {
-        title: "Barber of the Week",
-        body: "This week's top barbershops are in — see them at the top of the app.",
-        data: { type: "BARBER_OF_WEEK" },
-      },
-    );
+  audit(req, {
+    action: "barberOfWeek.set",
+    targetType: "Barbershop",
+    detail: { shopIds },
+  });
+
+  // Announce it. Feed rows are written in batches before this resolves; the
+  // push wave is metered out over the following minutes so every recipient
+  // doesn't open the app in the same second. See services/broadcast.ts.
+  let notified = 0;
+  if (shopIds.length > 0) {
+    const result = await broadcastToAllUsers({
+      type: "BARBER_OF_WEEK",
+      title: "Barber of the Week",
+      body: "This week's top barbershops are in — see them at the top of the app.",
+      data: { type: "BARBER_OF_WEEK" },
+    });
+    notified = result.users;
   }
 
-  res.json({ ok: true, count: shopIds.length, notified: users.length });
+  res.json({ ok: true, count: shopIds.length, notified });
 });
 
 // ---- Subscriptions ----
@@ -645,6 +707,19 @@ adminRouter.put("/shops/:id/subscription", validate(subSchema), async (req, res)
     update: { planId, status: "ACTIVE", currentPeriodStart: base, currentPeriodEnd: end },
     include: { plan: { select: { name: true } } },
   });
+  // Subscriptions are the revenue event on this platform — this is the single
+  // most important thing in the trail.
+  audit(req, {
+    action: "subscription.assign",
+    targetType: "Barbershop",
+    targetId: shop.id,
+    detail: {
+      planId,
+      planName: subscription.plan.name,
+      months,
+      currentPeriodEnd: subscription.currentPeriodEnd.toISOString(),
+    },
+  });
   res.json({
     subscription: {
       planName: subscription.plan.name,
@@ -659,7 +734,57 @@ adminRouter.delete("/shops/:id/subscription", async (req, res) => {
     .update({ where: { shopId: req.params.id }, data: { status: "CANCELLED" } })
     .catch(() => null);
   if (!sub) throw ApiError.notFound("No subscription for this shop");
+  audit(req, {
+    action: "subscription.cancel",
+    targetType: "Barbershop",
+    targetId: req.params.id,
+    detail: { planId: sub.planId },
+  });
   res.json({ ok: true });
+});
+
+// ---- Audit trail ----
+
+const auditListSchema = z.object({
+  action: z.string().trim().max(60).optional(),
+  targetId: z.string().trim().max(60).optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(50),
+});
+
+// Read-only view of the admin trail. There is deliberately no write or delete
+// route: the log is append-only, written by lib/audit.ts as a side effect of
+// the action it records, and trimmed only by the retention sweep.
+adminRouter.get("/audit-logs", validate(auditListSchema, "query"), async (req, res) => {
+  const q = parsed<z.infer<typeof auditListSchema>>(req);
+  const where = {
+    ...(q.action ? { action: q.action } : {}),
+    ...(q.targetId ? { targetId: q.targetId } : {}),
+  };
+  const [total, entries] = await Promise.all([
+    prisma.auditLog.count({ where }),
+    prisma.auditLog.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      skip: (q.page - 1) * q.pageSize,
+      take: q.pageSize,
+    }),
+  ]);
+  res.json({
+    entries: entries.map((e) => ({
+      id: e.id,
+      actorEmail: e.actorEmail,
+      action: e.action,
+      targetType: e.targetType,
+      targetId: e.targetId,
+      detail: e.detail,
+      ip: e.ip,
+      createdAt: e.createdAt.toISOString(),
+    })),
+    page: q.page,
+    pageSize: q.pageSize,
+    total,
+  });
 });
 
 // ---- Reservations overview ----

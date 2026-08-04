@@ -5,16 +5,30 @@
 # marked `sync: false`.
 #
 # Notes
-# - `npm start` runs `prisma migrate deploy` before boot, so migrations apply
-#   on every deploy (including the btree_gist exclusion constraint — Render
-#   Postgres allows trusted extensions).
-# - Health checks hit /api/health/ready (verifies the DB), so a deploy only
-#   goes live once it can actually serve traffic.
+# - Migrations run in `preDeployCommand`, NOT at process start. They therefore
+#   run exactly once per deploy, before any new instance boots, and a failed
+#   migration aborts the deploy instead of crash-looping every instance. (When
+#   migrations ran inside `npm start`, scaling to more than one instance meant
+#   concurrent `migrate deploy` runs contending for Prisma's advisory lock, and
+#   a bad migration took the service down rather than blocking the rollout.)
+# - Health checks hit /api/health/ready, which reports the database AND flips to
+#   503 as soon as the process starts draining — so a redeploy is pulled out of
+#   rotation before its socket closes instead of dropping in-flight requests.
 # - Plans: `starter` web + paid Postgres are the smallest tiers that DON'T
 #   sleep/expire. Render's free web tier spins down after ~15 min idle
-#   (30-60s cold starts — worse than the Railway cold starts you saw), and
-#   free Postgres is suspended after 30 days. Downgrade only for throwaway
-#   staging.
+#   (30-60s cold starts), and free Postgres is suspended after 30 days.
+#
+# Capacity / upgrade path (deliberately NOT applied here — each step is a
+# spend decision):
+# - `standard` web (2 GB / 1 CPU) is the cheapest meaningful vertical bump and
+#   needs no workspace change.
+# - Autoscaling requires a `pro` instance type AND a Professional workspace, so
+#   it is a step change in cost, not a toggle. Until then this runs as a single
+#   instance and absorbs bursts vertically only.
+# - `basic-1gb` Postgres (1 GB RAM, 10 GB storage) is the sensible next DB step.
+# - Before scaling PAST one instance, move the rate limiter to a shared store
+#   (rate-limit-redis) — the in-memory store means N instances allow N x the
+#   configured limit. See src/middleware/rateLimit.ts.
 
 services:
   - type: web
@@ -25,15 +39,28 @@ services:
     # --include=dev forces devDependencies (typescript, @types/*) to install
     # even though NODE_ENV=production is set below — tsc needs them to build.
     buildCommand: npm ci --include=dev && npm run build
+    # Runs once per deploy, before the new instance starts taking traffic.
+    preDeployCommand: npm run db:deploy
     startCommand: npm start
     healthCheckPath: /api/health/ready
     autoDeploy: true # deploy on every push to the default branch
     envVars:
       - key: NODE_ENV
         value: production
-      # The server refuses to boot in production without a real secret;
-      # Render generates a strong random value at create time.
+      # The server refuses to boot in production without real secrets;
+      # Render generates strong random values at create time.
+      #
+      # Customer sessions.
       - key: JWT_ACCESS_SECRET
+        generateValue: true
+      # Admin panel sessions. A SEPARATE secret on purpose: sharing one meant a
+      # single leak handed out platform admin, and left only a `role` claim
+      # between a customer token and the admin panel. The server refuses to boot
+      # if this equals JWT_ACCESS_SECRET.
+      #
+      # Rotating this invalidates every signed-in admin session (they log in
+      # again); it does not affect customers.
+      - key: JWT_ADMIN_SECRET
         generateValue: true
       - key: DATABASE_URL
         fromDatabase:
@@ -47,10 +74,6 @@ services:
       # (or left as the placeholder) /api/auth/google returns 503.
       - key: GOOGLE_CLIENT_ID
         sync: false
-      # Set to `true` to expose the password-less /api/auth/test-login on this
-      # production-mode deploy. STAGING ONLY — remove before real launch.
-      - key: ENABLE_TEST_LOGIN
-        sync: false
       # Whole Firebase service-account JSON as one value (see DEPLOYMENT.md).
       # Leave empty to run without push — the API no-ops FCM when unset.
       - key: FIREBASE_SERVICE_ACCOUNT
@@ -59,6 +82,19 @@ services:
         value: 8h
       - key: LOG_LEVEL
         value: info
+      # Prisma's default pool is `hostCpuCount * 2 + 1`, which inside a
+      # container bears no relation to the CPU this instance actually gets —
+      # and Render Postgres ships no PgBouncer. Pin it. Raise in step with the
+      # database plan, never past what the plan allows.
+      - key: DB_CONNECTION_LIMIT
+        value: "5"
+      #
+      # ENABLE_TEST_LOGIN is deliberately absent and must not be re-added.
+      # /api/auth/test-login signs in as ANY email with no credential, so it is
+      # account takeover for every user — including barbers, who are matched by
+      # email alone. It is now registered only when NODE_ENV != production, with
+      # no flag to override, because a flag makes that one mistyped dashboard
+      # value away. A staging deploy that wants it should not run as production.
 
 databases:
   - name: brb-postgres

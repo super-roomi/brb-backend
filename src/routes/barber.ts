@@ -20,7 +20,20 @@ async function barberForRequest(userId: string) {
   if (!user) throw ApiError.unauthorized();
   return prisma.barber.findUnique({
     where: { email: user.email },
-    include: { shop: { select: { id: true, name: true, nameAr: true, nameCkb: true } } },
+    // utcOffsetMinutes rides along because every "today" view needs the shop's
+    // local day. Fetching it here saves /stats and /today a second round trip
+    // each — they used to re-query Barbershop for this one column.
+    include: {
+      shop: {
+        select: {
+          id: true,
+          name: true,
+          nameAr: true,
+          nameCkb: true,
+          utcOffsetMinutes: true,
+        },
+      },
+    },
   });
 }
 
@@ -119,11 +132,7 @@ barberRouter.get("/stats", async (req, res) => {
   // "Today" means the shop's local calendar day (matches /barber/today), not
   // UTC's — otherwise, between 00:00 and 03:00 local (UTC+3), this tab and the
   // Today tab disagree about which day it is.
-  const shop = await prisma.barbershop.findUnique({
-    where: { id: barber.shopId },
-    select: { utcOffsetMinutes: true },
-  });
-  const { dayStart, dayEnd } = localDayRangeUtc(now, shop?.utcOffsetMinutes ?? 180);
+  const { dayStart, dayEnd } = localDayRangeUtc(now, barber.shop.utcOffsetMinutes);
 
   const [completedAgg, todayCount, upcomingCount, recent] = await Promise.all([
     // Earnings + lifetime cut count from completed (past, confirmed) bookings.
@@ -164,8 +173,11 @@ barberRouter.get("/stats", async (req, res) => {
       },
     },
     stats: {
-      totalCuts: completedAgg._count,
-      totalEarnings: completedAgg._sum.price ?? 0,
+      // archived* carries the appointments whose Reservation rows were removed
+      // when a customer deleted their account, so a deletion no longer rewrites
+      // this barber's lifetime totals. See DELETE /api/auth/me.
+      totalCuts: completedAgg._count + barber.archivedCuts,
+      totalEarnings: (completedAgg._sum.price ?? 0) + barber.archivedEarnings,
       todayBookings: todayCount,
       upcomingBookings: upcomingCount,
     },
@@ -186,11 +198,7 @@ barberRouter.get("/today", async (req, res) => {
   const barber = await barberForRequest(req.auth!.userId);
   if (!barber) throw ApiError.forbidden("Not registered as a barber", "NOT_A_BARBER");
 
-  const shop = await prisma.barbershop.findUnique({
-    where: { id: barber.shopId },
-    select: { utcOffsetMinutes: true },
-  });
-  const offset = shop?.utcOffsetMinutes ?? 180;
+  const offset = barber.shop.utcOffsetMinutes;
   const now = new Date();
   const { dayStart, dayEnd } = localDayRangeUtc(now, offset);
 

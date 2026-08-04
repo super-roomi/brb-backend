@@ -482,7 +482,18 @@ describe("admin", () => {
 
   it("blocks user tokens from admin routes", async () => {
     const res = await request(app).get("/api/admin/summary").set(auth(userToken));
-    expect(res.status).toBe(403);
+    // 401, not 403: admin tokens are signed with a separate secret and audience,
+    // so a customer token doesn't verify here at all — it never reaches the role
+    // check. That is the point of splitting the secrets.
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe("TOKEN_INVALID");
+  });
+
+  it("rejects an admin token on customer routes", async () => {
+    // The reverse direction: an admin token must not be usable as a customer
+    // session either, or the panel's long-lived token would double as one.
+    const res = await request(app).get("/api/auth/me").set(auth(adminToken));
+    expect(res.status).toBe(401);
   });
 
   it("creates a shop (hidden by default), toggles visibility live", async () => {
@@ -810,6 +821,209 @@ describe("device tokens (FCM)", () => {
       .set(auth(userToken))
       .send({ token: body.token });
     expect(un.status).toBe(200);
+  });
+});
+
+describe("admin audit trail", () => {
+  it("records a visibility change with the acting admin and target", async () => {
+    const before = await prisma.auditLog.count({ where: { action: "shop.visibility" } });
+
+    const res = await request(app)
+      .patch(`/api/admin/shops/${hiddenShopId}/visibility`)
+      .set(auth(adminToken))
+      .send({ isVisible: true });
+    expect(res.status).toBe(200);
+
+    // The audit write is deliberately fire-and-forget so it can never fail the
+    // action it records; give it a moment to land.
+    await vi.waitFor(async () => {
+      expect(await prisma.auditLog.count({ where: { action: "shop.visibility" } }))
+        .toBeGreaterThan(before);
+    });
+
+    const entry = await prisma.auditLog.findFirstOrThrow({
+      where: { action: "shop.visibility", targetId: hiddenShopId },
+      orderBy: { createdAt: "desc" },
+    });
+    expect(entry.actorEmail).toBe("admin@test.dev");
+    expect(entry.targetType).toBe("Barbershop");
+    expect(JSON.parse(entry.detail!)).toEqual({ isVisible: true });
+
+    // Put the fixture back the way the rest of the suite expects it.
+    await request(app)
+      .patch(`/api/admin/shops/${hiddenShopId}/visibility`)
+      .set(auth(adminToken))
+      .send({ isVisible: false });
+  });
+
+  it("exposes the trail read-only, newest first", async () => {
+    const res = await request(app)
+      .get("/api/admin/audit-logs")
+      .query({ action: "shop.visibility" })
+      .set(auth(adminToken));
+    expect(res.status).toBe(200);
+    expect(res.body.total).toBeGreaterThan(0);
+    const times = res.body.entries.map((e: { createdAt: string }) => Date.parse(e.createdAt));
+    expect([...times].sort((a: number, b: number) => b - a)).toEqual(times);
+  });
+
+  it("refuses the trail to a customer token", async () => {
+    const res = await request(app).get("/api/admin/audit-logs").set(auth(userToken));
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("barber of the week broadcast", () => {
+  it("writes a feed row for every user without holding one huge transaction", async () => {
+    // Eligibility requires a live shop on a featured-tier plan.
+    const featured = await prisma.plan.create({
+      data: { name: "Featured Test Plan", monthlyPrice: 50_000, features: "", isFeaturedTier: true },
+    });
+    await prisma.subscription.update({
+      where: { shopId },
+      data: { planId: featured.id },
+    });
+
+    const userCount = await prisma.user.count();
+    expect(userCount).toBeGreaterThan(0);
+    const before = await prisma.notification.count({ where: { type: "BARBER_OF_WEEK" } });
+
+    const res = await request(app)
+      .post("/api/admin/barber-of-week")
+      .set(auth(adminToken))
+      .send({ shopIds: [shopId] });
+    expect(res.status).toBe(200);
+    expect(res.body.notified).toBe(userCount);
+
+    // Feed rows are committed before the response resolves; only the push wave
+    // is deferred.
+    const after = await prisma.notification.count({ where: { type: "BARBER_OF_WEEK" } });
+    expect(after - before).toBe(userCount);
+
+    // And the pick itself is live on the public feed.
+    const feed = await request(app).get("/api/shops/of-the-week");
+    expect(feed.status).toBe(200);
+    expect(feed.body.shops.map((s: { id: string }) => s.id)).toContain(shopId);
+    expect(feed.headers["cache-control"]).toContain("max-age");
+  });
+});
+
+describe("nearby shops", () => {
+  it("returns live shops inside the radius, nearest first, with distances", async () => {
+    // The seeded live shop has coordinates; ask from a point a short walk away.
+    const shop = await prisma.barbershop.findUniqueOrThrow({ where: { id: shopId } });
+    if (shop.latitude == null || shop.longitude == null) {
+      await prisma.barbershop.update({
+        where: { id: shopId },
+        data: { latitude: 35.5558, longitude: 45.4351 },
+      });
+    }
+    const { latitude, longitude } = await prisma.barbershop.findUniqueOrThrow({
+      where: { id: shopId },
+    });
+
+    const res = await request(app)
+      .get("/api/shops/nearby")
+      .query({ lat: latitude, lng: longitude, radiusKm: 5 });
+    expect(res.status).toBe(200);
+    const ids = res.body.shops.map((s: { id: string }) => s.id);
+    expect(ids).toContain(shopId);
+    // Hidden/expired shops must not leak through the geo path either.
+    expect(ids).not.toContain(hiddenShopId);
+    const found = res.body.shops.find((s: { id: string }) => s.id === shopId);
+    expect(found.distanceMeters).toBeLessThan(500);
+
+    // Distances must come back ascending.
+    const distances = res.body.shops.map((s: { distanceMeters: number }) => s.distanceMeters);
+    expect([...distances].sort((a: number, b: number) => a - b)).toEqual(distances);
+  });
+
+  it("excludes shops outside the radius", async () => {
+    const { latitude, longitude } = await prisma.barbershop.findUniqueOrThrow({
+      where: { id: shopId },
+    });
+    // ~1 degree of latitude is ~111 km away; a 3 km radius must not reach it.
+    const res = await request(app)
+      .get("/api/shops/nearby")
+      .query({ lat: (latitude ?? 0) + 1, lng: longitude, radiusKm: 3 });
+    expect(res.status).toBe(200);
+    expect(res.body.shops.map((s: { id: string }) => s.id)).not.toContain(shopId);
+  });
+
+  it("rejects an out-of-range coordinate", async () => {
+    const res = await request(app).get("/api/shops/nearby").query({ lat: 99, lng: 0 });
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("account deletion", () => {
+  it("removes bookings and reviews but preserves the barber's lifetime totals", async () => {
+    // A completed visit for a throwaway customer, assigned to a barber.
+    const token = await newUserToken("deleting-customer@test.dev");
+    const user = await prisma.user.findUniqueOrThrow({
+      where: { email: "deleting-customer@test.dev" },
+    });
+    // This fixture shop is chair-based, so give it a barber to assign to.
+    const barber = await prisma.barber.create({
+      data: { shopId, name: "Earnings Keeper", email: "earnings-keeper@test.dev" },
+    });
+    const service = await prisma.service.findFirstOrThrow({ where: { shopId } });
+    const past = new Date(Date.now() - 3 * 86_400_000);
+
+    await prisma.reservation.create({
+      data: {
+        userId: user.id,
+        shopId,
+        serviceId: service.id,
+        barberId: barber.id,
+        price: 25_000,
+        startsAt: past,
+        endsAt: new Date(past.getTime() + 45 * 60_000),
+        status: "CONFIRMED",
+      },
+    });
+    await prisma.review.create({
+      data: { userId: user.id, shopId, rating: 5, comment: "Great cut, thanks!" },
+    });
+    // Rebuild the aggregate the way the review route does, so we start truthful.
+    const before = await prisma.review.aggregate({
+      where: { shopId },
+      _avg: { rating: true },
+      _count: true,
+    });
+    await prisma.barbershop.update({
+      where: { id: shopId },
+      data: {
+        ratingAvg: Math.round((before._avg.rating ?? 0) * 10) / 10,
+        ratingCount: before._count,
+      },
+    });
+
+    const del = await request(app).delete("/api/auth/me").set(auth(token));
+    expect(del.status).toBe(200);
+
+    // The customer's data is gone, as the privacy policy promises.
+    expect(await prisma.user.findUnique({ where: { id: user.id } })).toBeNull();
+    expect(await prisma.reservation.count({ where: { userId: user.id } })).toBe(0);
+    expect(await prisma.review.count({ where: { userId: user.id } })).toBe(0);
+
+    // The barber's earnings survived as anonymous aggregates.
+    const after = await prisma.barber.findUniqueOrThrow({ where: { id: barber.id } });
+    expect(after.archivedCuts).toBe(1);
+    expect(after.archivedEarnings).toBe(25_000);
+
+    // And the shop's denormalized rating was rebuilt, not left stale.
+    const shopAfter = await prisma.barbershop.findUniqueOrThrow({ where: { id: shopId } });
+    const truth = await prisma.review.aggregate({
+      where: { shopId },
+      _avg: { rating: true },
+      _count: true,
+    });
+    expect(shopAfter.ratingCount).toBe(truth._count);
+    expect(shopAfter.ratingAvg).toBeCloseTo(
+      Math.round((truth._avg.rating ?? 0) * 10) / 10,
+      5,
+    );
   });
 });
 
