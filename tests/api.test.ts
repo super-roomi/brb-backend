@@ -873,6 +873,40 @@ describe("admin audit trail", () => {
   });
 });
 
+describe("admin customers", () => {
+  it("lists customers with the reviews they've written, filtered by search", async () => {
+    const reviewer = await prisma.user.create({
+      data: { email: "reviewer@test.dev", name: "Reviewer Rae" },
+    });
+    await prisma.review.create({
+      data: { userId: reviewer.id, shopId, rating: 5, comment: "Sharpest fade in town." },
+    });
+
+    const res = await request(app)
+      .get("/api/admin/customers")
+      .query({ search: "reviewer@test.dev" })
+      .set(auth(adminToken));
+    expect(res.status).toBe(200);
+
+    const row = res.body.customers.find(
+      (c: { email: string }) => c.email === "reviewer@test.dev",
+    );
+    expect(row).toBeTruthy();
+    expect(row.reviewCount).toBe(1);
+    expect(row.reviews).toHaveLength(1);
+    expect(row.reviews[0]).toMatchObject({
+      shopName: "Testable Cuts",
+      rating: 5,
+      comment: "Sharpest fade in town.",
+    });
+  });
+
+  it("refuses the customer list to a customer token", async () => {
+    const res = await request(app).get("/api/admin/customers").set(auth(userToken));
+    expect(res.status).toBe(401);
+  });
+});
+
 describe("barber of the week broadcast", () => {
   it("writes a feed row for every user without holding one huge transaction", async () => {
     // Eligibility requires a live shop on a featured-tier plan.

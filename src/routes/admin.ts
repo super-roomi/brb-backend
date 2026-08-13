@@ -829,3 +829,65 @@ adminRouter.get("/reservations", validate(resListSchema, "query"), async (req, r
     total,
   });
 });
+
+// ---- Customers ----
+
+const customerListSchema = z.object({
+  // Filters by name or email (case-insensitive substring).
+  search: z.string().trim().max(80).optional(),
+  page: z.coerce.number().int().min(1).default(1),
+});
+
+// Every customer, newest first, with the reviews they've written. A review
+// targets a barbershop (not an individual barber) — see the Review model — so
+// each entry names the shop. Read-only; not audited. Barbers are customers too
+// (a barber is a User whose email also exists in the Barber table), so they
+// appear here as well.
+adminRouter.get("/customers", validate(customerListSchema, "query"), async (req, res) => {
+  const q = parsed<z.infer<typeof customerListSchema>>(req);
+  const pageSize = 25;
+  const where = q.search
+    ? {
+        OR: [
+          { name: { contains: q.search, mode: "insensitive" as const } },
+          { email: { contains: q.search, mode: "insensitive" as const } },
+        ],
+      }
+    : {};
+  const [total, users] = await Promise.all([
+    prisma.user.count({ where }),
+    prisma.user.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      skip: (q.page - 1) * pageSize,
+      take: pageSize,
+      include: {
+        _count: { select: { reservations: true, reviews: true } },
+        reviews: {
+          include: { shop: { select: { name: true } } },
+          orderBy: { createdAt: "desc" },
+        },
+      },
+    }),
+  ]);
+  res.json({
+    customers: users.map((u) => ({
+      id: u.id,
+      name: u.name,
+      email: u.email,
+      createdAt: u.createdAt.toISOString(),
+      reservationCount: u._count.reservations,
+      reviewCount: u._count.reviews,
+      reviews: u.reviews.map((r) => ({
+        id: r.id,
+        shopName: r.shop.name,
+        rating: r.rating,
+        comment: r.comment,
+        createdAt: r.createdAt.toISOString(),
+      })),
+    })),
+    page: q.page,
+    pageSize,
+    total,
+  });
+});
