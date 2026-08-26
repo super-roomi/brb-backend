@@ -79,6 +79,8 @@ catalogRouter.get("/shops", validate(listSchema, "query"), async (req, res) => {
     // (higher = better placement). The plan's monthly price doubles as the
     // ordering value; visible shops always have an active subscription.
     tierRank: s.subscription?.plan.monthlyPrice ?? 0,
+    // Lets the shop card show a "bring a friend" deal badge in the list; 0 = off.
+    referralDiscount: s.referralDiscount,
   }));
 
   // Browse traffic dwarfs writes; a short public cache absorbs repeat opens.
@@ -113,6 +115,7 @@ catalogRouter.get("/shops/of-the-week", async (req, res) => {
       ratingAvg: s.ratingAvg,
       ratingCount: s.ratingCount,
       isFeatured: true,
+      referralDiscount: s.referralDiscount,
     })),
   });
 });
@@ -185,6 +188,7 @@ catalogRouter.get("/shops/nearby", validate(nearbySchema, "query"), async (req, 
       ratingCount: s.ratingCount,
       isFeatured: s.subscription?.plan.isFeaturedTier ?? false,
       tierRank: s.subscription?.plan.monthlyPrice ?? 0,
+      referralDiscount: s.referralDiscount,
       // Server-measured, so the client no longer needs every shop's coordinates
       // to rank them.
       distanceMeters: Math.round(meters),

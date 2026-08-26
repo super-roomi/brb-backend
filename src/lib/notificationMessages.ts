@@ -165,3 +165,27 @@ function localizeAmount(amount: number, lang: Lang): string {
   if (lang !== "ar" && lang !== "ckb") return grouped;
   return grouped.replace(/[0-9]/g, (d) => EASTERN_DIGITS[Number(d)]);
 }
+
+export function referralDealStarted(
+  lang: Lang,
+  p: { shop: string; amount: number; lang: Lang },
+): NotificationText {
+  const amount = localizeAmount(p.amount, p.lang);
+  switch (lang) {
+    case "ar":
+      return {
+        title: "عرض جديد: أحضر صديقًا",
+        body: `${p.shop} يقدّم الآن خصم ${amount} د.ع لكل شخص عند الحجز مع صديق.`,
+      };
+    case "ckb":
+      return {
+        title: "داشکاندنی نوێ: هاوڕێیەک بهێنە",
+        body: `${p.shop} ئێستا ${amount} د.ع داشکاندن پێشکەش دەکات بۆ هەر کەسێک کاتێک لەگەڵ هاوڕێیەک حیجز دەکەیت.`,
+      };
+    default:
+      return {
+        title: "New bring-a-friend deal",
+        body: `${p.shop} is now offering ${amount} IQD off each when you book with a friend.`,
+      };
+  }
+}

@@ -11,6 +11,9 @@ import { isShopLive } from "../services/booking.js";
 import { adminLoginLimiter } from "../middleware/rateLimit.js";
 import { addMonths } from "../lib/time.js";
 import { audit } from "../lib/audit.js";
+import { referralDealStarted } from "../lib/notificationMessages.js";
+import { localize } from "../lib/localize.js";
+import { logger } from "../lib/logger.js";
 import { broadcastToAllUsers, isBroadcastRunning } from "../services/broadcast.js";
 import { STANDARD_SERVICE } from "../lib/standardService.js";
 
@@ -469,8 +472,54 @@ adminRouter.patch("/shops/:id", validate(shopBase.partial()), async (req, res) =
     // customer-adjacent content into it for no investigative benefit.
     detail: { fields: Object.keys(body) },
   });
+
+  // A shop "starting a deal": the promo just went from off to on. Tell
+  // customers — but only about a shop they can actually book (live), and
+  // fire-and-forget so a slow broadcast never holds up the admin's save.
+  const startedDeal =
+    existing.referralDiscount === 0 &&
+    body.referralDiscount !== undefined &&
+    body.referralDiscount > 0;
+  if (startedDeal) {
+    void announceReferralDeal(existing.id).catch((err) =>
+      logger.error({ err, shopId: existing.id }, "referral deal announcement failed"),
+    );
+  }
+
   res.json({ ok: true });
 });
+
+// Announce a shop's newly-started bring-a-friend deal to every customer. Feed
+// rows are localized per user; the push nudge uses the default language. No-op
+// if the shop is no longer live, the promo was cleared again, or another
+// broadcast is mid-flight (the deal simply isn't announced this time).
+async function announceReferralDeal(shopId: string): Promise<void> {
+  const shop = await prisma.barbershop.findUnique({
+    where: { id: shopId },
+    include: { subscription: true },
+  });
+  if (!shop || !isShopLive(shop) || shop.referralDiscount <= 0) return;
+  if (isBroadcastRunning()) return;
+
+  const amount = shop.referralDiscount;
+  const dflt = referralDealStarted("en", {
+    shop: shop.name,
+    amount,
+    lang: "en",
+  });
+  await broadcastToAllUsers({
+    type: "REFERRAL_DEAL",
+    title: dflt.title,
+    body: dflt.body,
+    data: { type: "REFERRAL_DEAL", shopId: shop.id },
+    build: (lang) =>
+      referralDealStarted(lang, {
+        shop: localize(lang, shop.name, shop.nameAr, shop.nameCkb),
+        amount,
+        lang,
+      }),
+  });
+}
 
 const visibilitySchema = z.object({ isVisible: z.boolean() });
 

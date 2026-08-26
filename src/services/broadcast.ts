@@ -1,6 +1,8 @@
 import { prisma } from "../lib/prisma.js";
 import { logger } from "../lib/logger.js";
 import { sendPushToTokens, type PushMessage } from "../lib/push.js";
+import { parseLang, type Lang } from "../lib/localize.js";
+import { type NotificationText } from "../lib/notificationMessages.js";
 
 // Platform-wide announcements (currently: Barber of the Week).
 //
@@ -55,9 +57,15 @@ const sleep = (ms: number) =>
 
 export interface Broadcast {
   type: string;
+  // Default copy — used for the push nudge (which can't cheaply localise per
+  // device) and as the fallback feed copy when `build` is absent.
   title: string;
   body: string;
   data?: Record<string, string>;
+  // When present, each user's FEED row is written in their own language. The
+  // feed is the durable thing customers actually read, so it is worth
+  // localising even though the push stays in the default language.
+  build?: (lang: Lang) => NotificationText;
 }
 
 export interface BroadcastResult {
@@ -91,7 +99,7 @@ export async function broadcastToAllUsers(msg: Broadcast): Promise<BroadcastResu
     let cursor: string | undefined;
     for (;;) {
       const batch = await prisma.user.findMany({
-        select: { id: true },
+        select: { id: true, lang: true },
         orderBy: { id: "asc" },
         take: FEED_BATCH,
         ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
@@ -99,12 +107,15 @@ export async function broadcastToAllUsers(msg: Broadcast): Promise<BroadcastResu
       if (batch.length === 0) break;
 
       await prisma.notification.createMany({
-        data: batch.map((u) => ({
-          userId: u.id,
-          type: msg.type,
-          title: msg.title,
-          body: msg.body,
-        })),
+        data: batch.map((u) => {
+          const copy = msg.build ? msg.build(parseLang(u.lang)) : msg;
+          return {
+            userId: u.id,
+            type: msg.type,
+            title: copy.title,
+            body: copy.body,
+          };
+        }),
       });
 
       users += batch.length;
