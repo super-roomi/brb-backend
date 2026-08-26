@@ -8,6 +8,12 @@ import {
   createReservation,
   reservationInclude,
 } from "../services/booking.js";
+import {
+  createInvite,
+  joinInvite,
+  pairForReservation,
+  recordScan,
+} from "../services/referral.js";
 import { isValidDateString } from "../lib/time.js";
 import { parseLang, localize, type Lang } from "../lib/localize.js";
 
@@ -56,6 +62,45 @@ reservationsRouter.post("/:id/cancel", async (req, res) => {
   res.json({ reservation: serialize(reservation, parseLang(req.query.lang)) });
 });
 
+// ---- Referral ("bring a friend") ----
+//
+// Earning the discount takes two independent proofs, so it takes two steps that
+// cannot substitute for each other: redeeming a code links the two bookings,
+// and scanning the barber's QR proves both people are actually at the shop.
+// See services/referral.ts.
+
+// The caller's referral state for one booking (null when there is none).
+reservationsRouter.get("/:id/referral", async (req, res) => {
+  const pair = await pairForReservation(req.auth!.userId, req.params.id);
+  res.json({ referral: pair });
+});
+
+// Issue a code to share with a friend. Idempotent — repeated taps return the
+// same code rather than minting more.
+reservationsRouter.post("/:id/referral/invite", async (req, res) => {
+  const pair = await createInvite(req.auth!.userId, req.params.id);
+  res.status(201).json({ referral: pair });
+});
+
+const joinSchema = z.object({ code: z.string().trim().min(4).max(12) });
+
+// Redeem a friend's code against this booking. Links only — no discount yet.
+reservationsRouter.post("/:id/referral/join", validate(joinSchema), async (req, res) => {
+  const { code } = parsed<z.infer<typeof joinSchema>>(req);
+  const pair = await joinInvite(req.auth!.userId, req.params.id, code);
+  res.json({ referral: pair });
+});
+
+const scanSchema = z.object({ token: z.string().trim().min(10).max(200) });
+
+// Record a scan of the barber's QR. The discount lands when the second person
+// scans, applied to both bookings at once.
+reservationsRouter.post("/:id/referral/scan", validate(scanSchema), async (req, res) => {
+  const { token } = parsed<z.infer<typeof scanSchema>>(req);
+  const result = await recordScan(req.auth!.userId, req.params.id, token);
+  res.json({ referral: result.pair, discountApplied: result.discountApplied });
+});
+
 type Loaded = Awaited<ReturnType<typeof cancelReservation>>;
 
 function serialize(r: Loaded, lang: Lang) {
@@ -65,6 +110,10 @@ function serialize(r: Loaded, lang: Lang) {
     status: completed ? "COMPLETED" : r.status,
     startsAt: r.startsAt.toISOString(),
     endsAt: r.endsAt.toISOString(),
+    // `price` stays the original; these two say what the referral took off and
+    // what is actually due at the chair, so the app never re-derives the sum.
+    discountAmount: r.discountAmount,
+    payableAmount: Math.max(0, r.price - r.discountAmount),
     // Localize content names; strip the Ar/Ckb columns from the payload.
     shop: {
       id: r.shop.id,
@@ -72,6 +121,7 @@ function serialize(r: Loaded, lang: Lang) {
       address: r.shop.address,
       imageUrl: r.shop.imageUrl,
       utcOffsetMinutes: r.shop.utcOffsetMinutes,
+      referralDiscount: r.shop.referralDiscount,
     },
     service: {
       id: r.service.id,

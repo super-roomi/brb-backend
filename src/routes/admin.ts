@@ -139,6 +139,10 @@ const shopBase = z.object({
   // Grace period (minutes) enforced between consecutive bookings per barber.
   bufferMin: z.number().int().min(0).max(180).default(0),
   utcOffsetMinutes: z.number().int().min(-720).max(840).default(180),
+  // "Bring a friend" promo: flat IQD off EACH of two paired bookings, funded by
+  // the barber. 0 turns it off for this shop, which is the default — a shop only
+  // runs the promo once an admin deliberately sets an amount.
+  referralDiscount: z.number().int().min(0).max(1_000_000).default(0),
   latitude: z.number().min(-90).max(90).nullable().optional(),
   longitude: z.number().min(-180).max(180).nullable().optional(),
   locationLabel: trShort,
@@ -192,6 +196,7 @@ adminRouter.get("/shops", validate(shopListSchema, "query"), async (req, res) =>
       address: s.address,
       isVisible: s.isVisible,
       isLive: isShopLive(s),
+      referralDiscount: s.referralDiscount,
       ratingAvg: s.ratingAvg,
       ratingCount: s.ratingCount,
       reservationCount: s._count.reservations,
@@ -246,6 +251,7 @@ adminRouter.post("/shops", validate(shopBase), async (req, res) => {
         chairCount: body.chairCount,
         bufferMin: body.bufferMin,
         utcOffsetMinutes: body.utcOffsetMinutes,
+        referralDiscount: body.referralDiscount,
         latitude: body.latitude ?? null,
         longitude: body.longitude ?? null,
         locationLabel: emptyToNull(body.locationLabel) ?? null,
@@ -362,6 +368,7 @@ adminRouter.patch("/shops/:id", validate(shopBase.partial()), async (req, res) =
         chairCount: body.chairCount,
         bufferMin: body.bufferMin,
         utcOffsetMinutes: body.utcOffsetMinutes,
+        referralDiscount: body.referralDiscount,
         latitude: body.latitude,
         longitude: body.longitude,
         locationLabel: emptyToNull(body.locationLabel),

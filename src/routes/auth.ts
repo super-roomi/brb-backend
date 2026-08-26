@@ -190,7 +190,9 @@ authRouter.delete("/me", requireUser, async (req, res) => {
     by: ["barberId"],
     where: { userId, status: "CONFIRMED", endsAt: { lt: now }, barberId: { not: null } },
     _count: { _all: true },
-    _sum: { price: true },
+    // Net of any referral discount the barber absorbed, so archiving matches
+    // what /barber/stats was reporting before the rows were removed.
+    _sum: { price: true, discountAmount: true },
   });
   // Shops this person reviewed, so their aggregates can be rebuilt after.
   const reviewed = await prisma.review.findMany({
@@ -205,7 +207,9 @@ authRouter.delete("/me", requireUser, async (req, res) => {
         where: { id: row.barberId! },
         data: {
           archivedCuts: { increment: row._count._all },
-          archivedEarnings: { increment: row._sum.price ?? 0 },
+          archivedEarnings: {
+            increment: (row._sum.price ?? 0) - (row._sum.discountAmount ?? 0),
+          },
         },
       });
     }

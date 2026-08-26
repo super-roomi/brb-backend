@@ -101,3 +101,67 @@ export function bookingReminder(
       };
   }
 }
+
+export function referralFriendJoined(
+  lang: Lang,
+  p: { friend: string | null },
+): NotificationText {
+  // Apple hides the real name behind a relay for some accounts, and a customer
+  // may simply have no name set — fall back to "your friend" rather than a gap.
+  const who =
+    p.friend ??
+    (lang === "ar" ? "صديقك" : lang === "ckb" ? "هاوڕێکەت" : "your friend");
+  switch (lang) {
+    case "ar":
+      return {
+        title: "انضم صديقك",
+        body: `حجز ${who} في نفس الصالون. امسحا رمز الحلّاق معًا للحصول على الخصم.`,
+      };
+    case "ckb":
+      return {
+        title: "هاوڕێکەت بەشدار بوو",
+        body: `${who} لە هەمان شوێن حجزی کرد. پێکەوە کۆدی سەرتاشەکە سکان بکەن بۆ داشکاندنەکە.`,
+      };
+    default:
+      return {
+        title: "Your friend joined",
+        body: `${who} booked at the same barbershop. Scan the barber's code together to get your discount.`,
+      };
+  }
+}
+
+export function referralDiscountEarned(
+  lang: Lang,
+  p: { amount: number; lang: Lang },
+): NotificationText {
+  // Digits are localized here (not by the caller) because this is the only
+  // place the amount appears, and Arabic/Kurdish render Eastern Arabic digits.
+  const amount = localizeAmount(p.amount, p.lang);
+  switch (lang) {
+    case "ar":
+      return {
+        title: "تم تطبيق الخصم",
+        body: `حصلت أنت وصديقك على خصم ${amount} د.ع لكل منكما.`,
+      };
+    case "ckb":
+      return {
+        title: "داشکاندن جێبەجێ کرا",
+        body: `تۆ و هاوڕێکەت هەریەکە ${amount} د.ع داشکاندنتان وەرگرت.`,
+      };
+    default:
+      return {
+        title: "Discount applied",
+        body: `You and your friend each got ${amount} IQD off.`,
+      };
+  }
+}
+
+const EASTERN_DIGITS = ["٠", "١", "٢", "٣", "٤", "٥", "٦", "٧", "٨", "٩"];
+
+// Group thousands, then map to Eastern Arabic-Indic digits for ar/ckb. Mirrors
+// the app's own `money` helper so a push reads the same as the screen it links to.
+function localizeAmount(amount: number, lang: Lang): string {
+  const grouped = amount.toLocaleString("en-US");
+  if (lang !== "ar" && lang !== "ckb") return grouped;
+  return grouped.replace(/[0-9]/g, (d) => EASTERN_DIGITS[Number(d)]);
+}

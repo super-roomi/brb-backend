@@ -7,6 +7,7 @@ import { localize, parseLang } from "../lib/localize.js";
 import { newReservation } from "../lib/notificationMessages.js";
 import { addDays, localDateToUtc, weekdayOfLocalDate } from "../lib/time.js";
 import { BOOKING_HORIZON_DAYS, BOOKING_LEAD_MIN, SLOT_STEP_MIN } from "./availability.js";
+import { voidPairForReservation } from "./referral.js";
 
 export const CANCEL_CUTOFF_MIN = 120; // cancellations allowed until 2h before start
 
@@ -328,6 +329,11 @@ export async function cancelReservation(userId: string, reservationId: string) {
       "RESERVATION_CHANGED",
     );
   }
+  // A cancelled booking can never complete its referral, so release the other
+  // person rather than leaving them holding a code that can't pay out.
+  // Best-effort: promo bookkeeping must never fail a cancellation.
+  await voidPairForReservation(reservationId);
+
   return prisma.reservation.findUniqueOrThrow({
     where: { id: reservationId },
     include: reservationInclude,
@@ -339,6 +345,9 @@ export const reservationInclude = {
     select: {
       id: true, name: true, nameAr: true, nameCkb: true,
       address: true, imageUrl: true, utcOffsetMinutes: true,
+      // Lets the app show the bring-a-friend offer on a booking card without a
+      // second round trip for the shop.
+      referralDiscount: true,
     },
   },
   service: {

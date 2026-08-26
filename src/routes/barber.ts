@@ -8,6 +8,7 @@ import { localDayRangeUtc } from "../lib/time.js";
 import { parseLang, localize } from "../lib/localize.js";
 import { sendPushToUser } from "../lib/push.js";
 import { bookingConfirmed, bookingDeclined } from "../lib/notificationMessages.js";
+import { mintBarberToken, voidPairForReservation, QR_TTL_MS } from "../services/referral.js";
 
 export const barberRouter = Router();
 barberRouter.use(requireUser);
@@ -31,6 +32,7 @@ async function barberForRequest(userId: string) {
           nameAr: true,
           nameCkb: true,
           utcOffsetMinutes: true,
+          referralDiscount: true,
         },
       },
     },
@@ -56,6 +58,9 @@ barberRouter.get("/me", async (req, res) => {
         name: localize(lang, barber.shop.name, barber.shop.nameAr, barber.shop.nameCkb),
       },
       autoApprove: barber.autoApprove,
+      // 0 when this shop isn't running bring-a-friend, so the app can hide the
+      // check-in QR rather than offering a button that only errors.
+      referralDiscount: barber.shop.referralDiscount,
     },
   });
 });
@@ -138,7 +143,9 @@ barberRouter.get("/stats", async (req, res) => {
     // Earnings + lifetime cut count from completed (past, confirmed) bookings.
     prisma.reservation.aggregate({
       where: { barberId: barber.id, status: "CONFIRMED", endsAt: { lt: now } },
-      _sum: { price: true },
+      // The barber funds the bring-a-friend promo, so earnings are the sum of
+      // what was actually payable: price - discountAmount.
+      _sum: { price: true, discountAmount: true },
       _count: true,
     }),
     prisma.reservation.count({
@@ -177,7 +184,10 @@ barberRouter.get("/stats", async (req, res) => {
       // when a customer deleted their account, so a deletion no longer rewrites
       // this barber's lifetime totals. See DELETE /api/auth/me.
       totalCuts: completedAgg._count + barber.archivedCuts,
-      totalEarnings: (completedAgg._sum.price ?? 0) + barber.archivedEarnings,
+      totalEarnings:
+        (completedAgg._sum.price ?? 0) -
+        (completedAgg._sum.discountAmount ?? 0) +
+        barber.archivedEarnings,
       todayBookings: todayCount,
       upcomingBookings: upcomingCount,
     },
@@ -185,7 +195,7 @@ barberRouter.get("/stats", async (req, res) => {
       id: r.id,
       serviceName: localize(lang, r.service.name, r.service.nameAr, r.service.nameCkb),
       customerName: r.user.name ?? "Customer",
-      price: r.price,
+      price: r.price - r.discountAmount,
       startsAt: r.startsAt.toISOString(),
       status: r.status === "CONFIRMED" && r.endsAt < now ? "COMPLETED" : r.status,
     })),
@@ -223,7 +233,9 @@ barberRouter.get("/today", async (req, res) => {
       serviceName: localize(lang, r.service.name, r.service.nameAr, r.service.nameCkb),
       durationMin: r.service.durationMin,
       customerName: r.user.name ?? r.user.email,
-      price: r.price,
+      // What to charge: the referral discount is already netted off.
+      price: r.price - r.discountAmount,
+      discountAmount: r.discountAmount,
       startsAt: r.startsAt.toISOString(),
       done: r.endsAt < now,
     })),
@@ -280,7 +292,7 @@ barberRouter.get("/customers", async (req, res) => {
       by: ["userId"],
       where: { barberId: barber.id, status: "CONFIRMED", endsAt: { lt: now } },
       _count: { _all: true },
-      _sum: { price: true },
+      _sum: { price: true, discountAmount: true },
     }),
   ]);
 
@@ -306,11 +318,35 @@ barberRouter.get("/customers", async (req, res) => {
       email: u?.email ?? "",
       visits: c?._count._all ?? 0,
       lastVisit: (r._max.startsAt ?? now).toISOString(),
-      spent: c?._sum.price ?? 0,
+      spent: (c?._sum.price ?? 0) - (c?._sum.discountAmount ?? 0),
     };
   });
 
   res.json({ customers });
+});
+
+// The QR the barber shows at the chair for "bring a friend" check-in.
+//
+// Short-lived and minted per request, so the app must keep asking while the
+// screen is open. That is the point: a token that outlived the visit could be
+// screenshotted and sent to a friend at home, and "both are present" would stop
+// meaning anything. Bound to this barber's shop via their own session.
+barberRouter.get("/referral-token", async (req, res) => {
+  const barber = await barberForRequest(req.auth!.userId);
+  if (!barber) throw ApiError.forbidden("Not registered as a barber", "NOT_A_BARBER");
+  if (barber.shop.referralDiscount <= 0) {
+    throw ApiError.badRequest(
+      "This barbershop is not running the bring-a-friend offer",
+      "REFERRAL_NOT_AVAILABLE",
+    );
+  }
+  const { token, expiresAt } = await mintBarberToken(barber.id, barber.shopId);
+  res.json({
+    token,
+    expiresAt: expiresAt.toISOString(),
+    ttlMs: QR_TTL_MS,
+    discountAmount: barber.shop.referralDiscount,
+  });
 });
 
 barberRouter.post("/reservations/:id/accept", async (req, res) => {
@@ -386,6 +422,9 @@ async function decideReservation(
       },
     });
   });
+
+  // A declined booking can't complete its referral either.
+  if (!accepted) void voidPairForReservation(reservationId);
 
   // Real push on top of the in-app record (no-op if FCM unconfigured).
   void sendPushToUser(reservation.userId, {

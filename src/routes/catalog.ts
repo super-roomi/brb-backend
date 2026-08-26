@@ -226,6 +226,9 @@ catalogRouter.get("/shops/:id", async (req, res) => {
       city: shop.city,
       chairCount: shop.chairCount,
       utcOffsetMinutes: shop.utcOffsetMinutes,
+      // 0 when this shop isn't running "bring a friend"; the app hides the
+      // whole feature in that case rather than offering an unearnable discount.
+      referralDiscount: shop.referralDiscount,
       latitude: shop.latitude,
       longitude: shop.longitude,
       locationLabel:

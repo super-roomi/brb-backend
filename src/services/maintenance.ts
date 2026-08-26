@@ -69,6 +69,21 @@ async function deleteOldNotifications(limit: number): Promise<number> {
   return count;
 }
 
+// QR tokens are minted roughly every 45 seconds per barber with the check-in
+// screen open, and are useless the moment they expire.
+async function deleteExpiredReferralTokens(limit: number): Promise<number> {
+  const rows = await prisma.referralToken.findMany({
+    where: { expiresAt: { lt: new Date() } },
+    select: { id: true },
+    take: limit,
+  });
+  if (rows.length === 0) return 0;
+  const { count } = await prisma.referralToken.deleteMany({
+    where: { id: { in: rows.map((r) => r.id) } },
+  });
+  return count;
+}
+
 async function deleteOldAuditLogs(limit: number): Promise<number> {
   const cutoff = new Date(Date.now() - env.auditRetentionDays * DAY_MS);
   const rows = await prisma.auditLog.findMany({
@@ -87,6 +102,7 @@ export async function runRetentionSweep(): Promise<void> {
   try {
     await deleteInChunks("RefreshToken", deleteExpiredRefreshTokens);
     await deleteInChunks("Notification", deleteOldNotifications);
+    await deleteInChunks("ReferralToken", deleteExpiredReferralTokens);
     await deleteInChunks("AuditLog", deleteOldAuditLogs);
   } catch (err) {
     // Never throw from a background timer: an unhandled rejection here would
