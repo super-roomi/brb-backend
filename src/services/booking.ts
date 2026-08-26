@@ -316,11 +316,18 @@ export async function cancelReservation(userId: string, reservationId: string) {
       "CANCEL_CUTOFF",
     );
   }
+  // A double booking ("book for two") is one booking: cancelling either cut
+  // cancels the whole group, so a friend is never left with a lone discounted
+  // half-visit. A single booking cancels just itself.
+  const groupWhere = reservation.groupId
+    ? { userId, groupId: reservation.groupId, status: { in: HOLDING_STATUSES } }
+    : { id: reservationId, userId, status: reservation.status };
+
   // Compare-and-swap on the status we validated: if a barber accepted or the
   // request was otherwise decided between our read and this write, no row
   // matches and we report the conflict instead of clobbering the new state.
   const updated = await prisma.reservation.updateMany({
-    where: { id: reservationId, userId, status: reservation.status },
+    where: groupWhere,
     data: { status: "CANCELLED" },
   });
   if (updated.count === 0) {
@@ -329,9 +336,9 @@ export async function cancelReservation(userId: string, reservationId: string) {
       "RESERVATION_CHANGED",
     );
   }
-  // A cancelled booking can never complete its referral, so release the other
-  // person rather than leaving them holding a code that can't pay out.
-  // Best-effort: promo bookkeeping must never fail a cancellation.
+  // A cancelled booking can never complete an (old-style) referral pair, so
+  // release the other person. Best-effort: promo bookkeeping must never fail a
+  // cancellation.
   await voidPairForReservation(reservationId);
 
   return prisma.reservation.findUniqueOrThrow({

@@ -18,6 +18,10 @@ export async function computeFreeSlots(
   date: string,
   serviceId: string,
   barberId?: string,
+  // Length of the block that must be free, defaulting to the service's own
+  // duration. A "book for two" double passes d1 + d2 so it only offers times
+  // where one barber is free for the whole back-to-back visit.
+  blockMinutes?: number,
 ): Promise<Slot[]> {
   const shop = await prisma.barbershop.findUnique({
     where: { id: shopId },
@@ -32,6 +36,7 @@ export async function computeFreeSlots(
   if (!shop || !isShopLive(shop)) throw ApiError.notFound("Barbershop not found");
   const service = shop.services[0];
   if (!service || !service.isActive) throw ApiError.notFound("Service not found");
+  const durationMin = blockMinutes ?? service.durationMin;
 
   const eligible = barberId
     ? shop.barbers.filter((b) => b.id === barberId)
@@ -73,12 +78,12 @@ export async function computeFreeSlots(
 
   for (
     let m = hours.openMinute;
-    m + service.durationMin <= hours.closeMinute;
+    m + durationMin <= hours.closeMinute;
     m += SLOT_STEP_MIN
   ) {
     const start = localDateToUtc(date, m, shop.utcOffsetMinutes);
     if (start.getTime() < earliest) continue;
-    const end = new Date(start.getTime() + service.durationMin * 60_000);
+    const end = new Date(start.getTime() + durationMin * 60_000);
 
     if (useBarbers) {
       const someoneFree = eligible.some(

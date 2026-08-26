@@ -4,6 +4,7 @@ import { prisma } from "../lib/prisma.js";
 import { ApiError } from "../lib/errors.js";
 import { validate, parsed } from "../middleware/validate.js";
 import { computeFreeSlots } from "../services/availability.js";
+import { computeDoubleSlots } from "../services/doubleBooking.js";
 import { isShopLive, liveShopWhere } from "../services/booking.js";
 import { isValidDateString } from "../lib/time.js";
 import { parseLang, localize } from "../lib/localize.js";
@@ -314,6 +315,29 @@ const availabilitySchema = z.object({
   // Optional: restrict availability to one barber.
   barberId: z.string().optional(),
 });
+
+// Times a "book for two" double can start on a day: slots where one barber is
+// free for the whole back-to-back block of both services.
+const doubleAvailabilitySchema = z.object({
+  date: z.string().refine(isValidDateString, "Expected YYYY-MM-DD"),
+  firstServiceId: z.string(),
+  secondServiceId: z.string(),
+});
+
+catalogRouter.get(
+  "/shops/:id/double-availability",
+  validate(doubleAvailabilitySchema, "query"),
+  async (req, res) => {
+    const q = parsed<z.infer<typeof doubleAvailabilitySchema>>(req);
+    const { slots, blockMinutes } = await computeDoubleSlots(
+      req.params.id,
+      q.date,
+      q.firstServiceId,
+      q.secondServiceId,
+    );
+    res.json({ date: q.date, slots, blockMinutes });
+  },
+);
 
 catalogRouter.get(
   "/shops/:id/availability",

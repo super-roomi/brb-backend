@@ -244,6 +244,15 @@ model Reservation {
   // booking invariant holds; the customer pays and the barber earns
   // `price - discountAmount`.
   discountAmount    Int           @default(0)
+  // A "book for two" double booking is two reservations sharing this id: the
+  // initiator's own cut and the friend's, placed back-to-back with one barber.
+  // Both carry the discount, and cancelling either cancels the whole group — it
+  // is one booking made by one person, so it lives and dies together. Null for
+  // an ordinary single booking.
+  groupId           String?
+  // The friend's display name on the second cut of a double, so the barber
+  // knows who is in the chair. Null on the initiator's own cut and on singles.
+  guestName         String?
   createdAt         DateTime      @default(now())
   // A reservation can sit on at most one side of at most one pair.
   referralAsInviter ReferralPair? @relation("PairInviter")
@@ -254,6 +263,8 @@ model Reservation {
   @@index([barberId, status, startsAt])
   // Reminder sweep looks up confirmed, not-yet-reminded, soon-starting rows.
   @@index([status, reminderSentAt, startsAt])
+  // Load both cuts of a double together (barber views, group cancellation).
+  @@index([groupId])
 }
 
 model Notification {

@@ -14,6 +14,7 @@ import {
   pairForReservation,
   recordScan,
 } from "../services/referral.js";
+import { computeDoubleSlots, createDoubleBooking } from "../services/doubleBooking.js";
 import { isValidDateString } from "../lib/time.js";
 import { parseLang, localize, type Lang } from "../lib/localize.js";
 
@@ -33,6 +34,26 @@ reservationsRouter.post("/", validate(createSchema), async (req, res) => {
   const body = parsed<z.infer<typeof createSchema>>(req);
   const reservation = await createReservation({ userId: req.auth!.userId, ...body });
   res.status(201).json({ reservation: serialize(reservation, parseLang(req.query.lang)) });
+});
+
+// "Book for two" — the same-visit bring-a-friend booking. One person books two
+// back-to-back cuts (their own + a friend's), both discounted. See
+// services/doubleBooking.ts.
+const doubleSchema = z.object({
+  shopId: z.string(),
+  date: z.string().refine(isValidDateString, "Expected YYYY-MM-DD"),
+  startMinute: z.number().int().min(0).max(24 * 60 - 1),
+  firstServiceId: z.string(),
+  secondServiceId: z.string(),
+  guestName: z.string().trim().min(1).max(60).optional(),
+  barberId: z.string().optional(),
+});
+
+reservationsRouter.post("/double", validate(doubleSchema), async (req, res) => {
+  const body = parsed<z.infer<typeof doubleSchema>>(req);
+  const cuts = await createDoubleBooking({ userId: req.auth!.userId, ...body });
+  const lang = parseLang(req.query.lang);
+  res.status(201).json({ reservations: cuts.map((c) => serialize(c, lang)) });
 });
 
 const listSchema = z.object({ scope: z.enum(["upcoming", "past"]).default("upcoming") });
@@ -114,6 +135,11 @@ function serialize(r: Loaded, lang: Lang) {
     // what is actually due at the chair, so the app never re-derives the sum.
     discountAmount: r.discountAmount,
     payableAmount: Math.max(0, r.price - r.discountAmount),
+    // Present on the two cuts of a "book for two" double. groupId is shared by
+    // the pair; guestName marks the friend's cut (null on the initiator's own).
+    groupId: r.groupId,
+    guestName: r.guestName,
+    isDouble: r.groupId !== null,
     // Localize content names; strip the Ar/Ckb columns from the payload.
     shop: {
       id: r.shop.id,

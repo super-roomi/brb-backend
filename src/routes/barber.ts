@@ -232,10 +232,14 @@ barberRouter.get("/today", async (req, res) => {
       id: r.id,
       serviceName: localize(lang, r.service.name, r.service.nameAr, r.service.nameCkb),
       durationMin: r.service.durationMin,
-      customerName: r.user.name ?? r.user.email,
+      // On a "book for two" double, the friend's cut carries a guest name; the
+      // initiator's own cut shows their account name like any single booking.
+      customerName: r.guestName ?? r.user.name ?? r.user.email,
       // What to charge: the referral discount is already netted off.
       price: r.price - r.discountAmount,
       discountAmount: r.discountAmount,
+      // Lets the barber see at a glance this is one half of a discounted double.
+      isDouble: r.groupId !== null,
       startsAt: r.startsAt.toISOString(),
       done: r.endsAt < now,
     })),
@@ -263,8 +267,11 @@ barberRouter.get("/requests", async (req, res) => {
       id: r.id,
       serviceName: localize(lang, r.service.name, r.service.nameAr, r.service.nameCkb),
       durationMin: r.service.durationMin,
-      customerName: r.user.name ?? r.user.email,
-      price: r.price,
+      customerName: r.guestName ?? r.user.name ?? r.user.email,
+      // The barber sees the discounted price and that it is part of a double.
+      price: r.price - r.discountAmount,
+      discountAmount: r.discountAmount,
+      isDouble: r.groupId !== null,
       startsAt: r.startsAt.toISOString(),
       utcOffsetMinutes: r.shop.utcOffsetMinutes,
     })),
