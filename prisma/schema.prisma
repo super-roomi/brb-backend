@@ -66,6 +66,10 @@ model AdminUser {
   email        String   @unique
   passwordHash String
   name         String
+  // Disabled admins keep their row (the audit trail's actorId references it and
+  // the denormalized actorEmail must stay resolvable) but can no longer log in.
+  // There is no hard delete for this reason.
+  isActive     Boolean  @default(true)
   createdAt    DateTime @default(now())
 }
 

@@ -7,7 +7,9 @@ import { ApiError } from "../lib/errors.js";
 import { signAdminToken } from "../lib/jwt.js";
 import { requireAdmin } from "../middleware/auth.js";
 import { validate, parsed } from "../middleware/validate.js";
-import { isShopLive } from "../services/booking.js";
+import { isShopLive, adminCancelReservation } from "../services/booking.js";
+import { notifyUser } from "../lib/notify.js";
+import { bookingCancelledByShop } from "../lib/notificationMessages.js";
 import { adminLoginLimiter } from "../middleware/rateLimit.js";
 import { addMonths } from "../lib/time.js";
 import { audit } from "../lib/audit.js";
@@ -26,6 +28,12 @@ adminRouter.post("/login", adminLoginLimiter, validate(loginSchema), async (req,
   const admin = await prisma.adminUser.findUnique({ where: { email } });
   // Same error for unknown email and wrong password — no account probing.
   if (!admin || !(await bcrypt.compare(password, admin.passwordHash))) {
+    throw ApiError.unauthorized("Invalid credentials", "BAD_CREDENTIALS");
+  }
+  // A disabled admin's row is kept so the audit trail stays resolvable, but the
+  // credential must stop working. Same generic message — don't reveal that the
+  // account exists but is off.
+  if (!admin.isActive) {
     throw ApiError.unauthorized("Invalid credentials", "BAD_CREDENTIALS");
   }
   // Signed with the dedicated admin secret and audience (see lib/jwt.ts), so a
@@ -77,6 +85,78 @@ adminRouter.post("/cities", validate(citySchema), async (req, res) => {
   res.status(201).json({ city });
 });
 
+const slugify = (name: string) => name.toLowerCase().replace(/\s+/g, "-");
+
+// Rename a city. Both name and slug are unique; regenerate the slug from the new
+// name so app-facing links stay consistent. A typo used to be permanent.
+adminRouter.patch("/cities/:id", validate(citySchema), async (req, res) => {
+  const { name } = parsed<z.infer<typeof citySchema>>(req);
+  const existing = await prisma.city.findUnique({ where: { id: req.params.id } });
+  if (!existing) throw ApiError.notFound("City not found");
+  const city = await prisma.city
+    .update({ where: { id: existing.id }, data: { name, slug: slugify(name) } })
+    .catch(() => {
+      throw ApiError.conflict("Another city already has that name", "CITY_EXISTS");
+    });
+  audit(req, {
+    action: "city.update",
+    targetType: "City",
+    targetId: city.id,
+    detail: { from: existing.name, to: name },
+  });
+  res.json({ city });
+});
+
+// Delete a city — only when nothing references it. A city with shops must be
+// merged (below), not deleted, or its shops would be orphaned.
+adminRouter.delete("/cities/:id", async (req, res) => {
+  const city = await prisma.city.findUnique({
+    where: { id: req.params.id },
+    include: { _count: { select: { shops: true } } },
+  });
+  if (!city) throw ApiError.notFound("City not found");
+  if (city._count.shops > 0) {
+    throw ApiError.badRequest(
+      "This city still has shops. Merge it into another city first.",
+      "CITY_HAS_SHOPS",
+    );
+  }
+  await prisma.city.delete({ where: { id: city.id } });
+  audit(req, { action: "city.delete", targetType: "City", targetId: city.id, detail: { name: city.name } });
+  res.json({ ok: true });
+});
+
+// Merge one city into another: reassign every shop, then delete the now-empty
+// source. This is how a duplicate or misspelled city gets fixed without
+// orphaning its shops — the reassignment and delete are one transaction so a
+// failure can't leave shops pointing at a city that is about to vanish.
+const mergeSchema = z.object({ intoId: z.string() });
+adminRouter.post("/cities/:id/merge", validate(mergeSchema), async (req, res) => {
+  const { intoId } = parsed<z.infer<typeof mergeSchema>>(req);
+  if (intoId === req.params.id) {
+    throw ApiError.badRequest("Can't merge a city into itself", "CITY_MERGE_SELF");
+  }
+  const [source, target] = await Promise.all([
+    prisma.city.findUnique({ where: { id: req.params.id }, include: { _count: { select: { shops: true } } } }),
+    prisma.city.findUnique({ where: { id: intoId } }),
+  ]);
+  if (!source) throw ApiError.notFound("City not found");
+  if (!target) throw ApiError.badRequest("Target city not found", "CITY_MERGE_TARGET");
+
+  const moved = source._count.shops;
+  await prisma.$transaction([
+    prisma.barbershop.updateMany({ where: { cityId: source.id }, data: { cityId: target.id } }),
+    prisma.city.delete({ where: { id: source.id } }),
+  ]);
+  audit(req, {
+    action: "city.merge",
+    targetType: "City",
+    targetId: target.id,
+    detail: { from: source.name, into: target.name, shopsMoved: moved },
+  });
+  res.json({ ok: true, shopsMoved: moved });
+});
+
 // ---- Barbershops ----
 
 const hoursSchema = z
@@ -119,6 +199,10 @@ const barberSchema = z.object({
   // email would silently lock the barber out of their dashboard.
   email: z.string().trim().toLowerCase().email().max(120),
   isActive: z.boolean().default(true),
+  // Barbers normally toggle this themselves in the app; exposing it here lets an
+  // admin diagnose "why is this booking stuck PENDING" from the panel. Optional
+  // so an update that omits it doesn't clobber the barber's own choice.
+  autoApprove: z.boolean().optional(),
 });
 
 // Empty string clears a social link; otherwise must be a URL.
@@ -175,7 +259,8 @@ const shopListSchema = z.object({
 
 adminRouter.get("/shops", validate(shopListSchema, "query"), async (req, res) => {
   const q = parsed<z.infer<typeof shopListSchema>>(req);
-  const [total, shops] = await Promise.all([
+  const since = new Date(Date.now() - 30 * 86_400_000);
+  const [total, shops, recentGroups] = await Promise.all([
     prisma.barbershop.count(),
     prisma.barbershop.findMany({
       include: {
@@ -187,7 +272,16 @@ adminRouter.get("/shops", validate(shopListSchema, "query"), async (req, res) =>
       skip: (q.page - 1) * q.pageSize,
       take: q.pageSize,
     }),
+    // Bookings in the last 30 days, per shop. A lifetime count can't tell a
+    // thriving shop from one that stopped getting bookings a month ago; this
+    // can. One grouped query rather than a per-row subquery.
+    prisma.reservation.groupBy({
+      by: ["shopId"],
+      where: { createdAt: { gte: since } },
+      _count: true,
+    }),
   ]);
+  const recentByShop = new Map(recentGroups.map((g) => [g.shopId, g._count]));
   res.json({
     page: q.page,
     pageSize: q.pageSize,
@@ -203,6 +297,7 @@ adminRouter.get("/shops", validate(shopListSchema, "query"), async (req, res) =>
       ratingAvg: s.ratingAvg,
       ratingCount: s.ratingCount,
       reservationCount: s._count.reservations,
+      recentReservationCount: recentByShop.get(s.id) ?? 0,
       subscription: s.subscription
         ? {
             plan: s.subscription.plan,
@@ -296,6 +391,7 @@ adminRouter.post("/shops", validate(shopBase), async (req, res) => {
             nameCkb: emptyToNull(b.nameCkb) ?? null,
             email: b.email,
             isActive: b.isActive,
+            autoApprove: b.autoApprove ?? false,
           })),
         },
       },
@@ -447,6 +543,8 @@ adminRouter.patch("/shops/:id", validate(shopBase.partial()), async (req, res) =
               nameCkb: emptyToNull(b.nameCkb),
               email: b.email,
               isActive: b.isActive,
+              // Only when the payload carries it — undefined leaves it as is.
+              autoApprove: b.autoApprove,
             },
           });
         } else {
@@ -458,6 +556,7 @@ adminRouter.patch("/shops/:id", validate(shopBase.partial()), async (req, res) =
               nameCkb: emptyToNull(b.nameCkb) ?? null,
               email: b.email,
               isActive: b.isActive,
+              autoApprove: b.autoApprove ?? false,
             },
           });
         }
@@ -541,10 +640,25 @@ adminRouter.patch("/shops/:id/visibility", validate(visibilitySchema), async (re
 // ---- Plans ----
 
 adminRouter.get("/plans", async (_req, res) => {
-  const plans = await prisma.plan.findMany({
-    orderBy: { monthlyPrice: "asc" },
-    include: { _count: { select: { subscriptions: true } } },
-  });
+  const now = new Date();
+  const [plans, activeGroups] = await Promise.all([
+    prisma.plan.findMany({
+      orderBy: { monthlyPrice: "asc" },
+      // Raw count of every subscription row that references the plan. This is
+      // what the delete guard cares about: the database's foreign key blocks a
+      // delete while ANY subscription points here, cancelled ones included.
+      include: { _count: { select: { subscriptions: true } } },
+    }),
+    // Paying subscribers: ACTIVE and not yet expired. A cancelled or lapsed row
+    // still counts under _count above but must not inflate this figure — it is
+    // the number an operator prices against.
+    prisma.subscription.groupBy({
+      by: ["planId"],
+      where: { status: "ACTIVE", currentPeriodEnd: { gt: now } },
+      _count: true,
+    }),
+  ]);
+  const activeByPlan = new Map(activeGroups.map((g) => [g.planId, g._count]));
   res.json({
     plans: plans.map((p) => ({
       id: p.id,
@@ -553,7 +667,9 @@ adminRouter.get("/plans", async (_req, res) => {
       features: p.features,
       isFeaturedTier: p.isFeaturedTier,
       isActive: p.isActive,
+      // Total rows (drives the delete guard); active subscribers (the real one).
       subscriberCount: p._count.subscriptions,
+      activeSubscriberCount: activeByPlan.get(p.id) ?? 0,
     })),
   });
 });
@@ -847,13 +963,42 @@ adminRouter.get("/audit-logs", validate(auditListSchema, "query"), async (req, r
 
 const resListSchema = z.object({
   shopId: z.string().optional(),
+  // COMPLETED is not a stored status — it is a CONFIRMED booking whose end time
+  // has passed — so it is filtered specially below rather than matched directly.
+  status: z.enum(["PENDING", "CONFIRMED", "COMPLETED", "DECLINED", "CANCELLED"]).optional(),
+  // Inclusive date bounds on the appointment start (ISO date or datetime).
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
   page: z.coerce.number().int().min(1).default(1),
 });
+
+// Translate the requested status into a Prisma filter on startsAt/status.
+// COMPLETED and CONFIRMED both map onto stored status CONFIRMED, split by
+// whether the booking has already ended.
+function reservationStatusWhere(status: string | undefined, now: Date) {
+  switch (status) {
+    case undefined:
+      return {};
+    case "COMPLETED":
+      return { status: "CONFIRMED", endsAt: { lt: now } };
+    case "CONFIRMED":
+      return { status: "CONFIRMED", endsAt: { gte: now } };
+    default:
+      return { status };
+  }
+}
 
 adminRouter.get("/reservations", validate(resListSchema, "query"), async (req, res) => {
   const q = parsed<z.infer<typeof resListSchema>>(req);
   const pageSize = 30;
-  const where = q.shopId ? { shopId: q.shopId } : {};
+  const now = new Date();
+  const where = {
+    ...(q.shopId ? { shopId: q.shopId } : {}),
+    ...reservationStatusWhere(q.status, now),
+    ...(q.from || q.to
+      ? { startsAt: { ...(q.from ? { gte: q.from } : {}), ...(q.to ? { lte: q.to } : {}) } }
+      : {}),
+  };
   const [total, reservations] = await Promise.all([
     prisma.reservation.count({ where }),
     prisma.reservation.findMany({
@@ -872,7 +1017,7 @@ adminRouter.get("/reservations", validate(resListSchema, "query"), async (req, r
   res.json({
     reservations: reservations.map((r) => ({
       id: r.id,
-      status: r.status === "CONFIRMED" && r.endsAt < new Date() ? "COMPLETED" : r.status,
+      status: r.status === "CONFIRMED" && r.endsAt < now ? "COMPLETED" : r.status,
       startsAt: r.startsAt.toISOString(),
       customer: r.user.name ?? r.user.email,
       shopName: r.shop.name,
@@ -884,6 +1029,222 @@ adminRouter.get("/reservations", validate(resListSchema, "query"), async (req, r
     pageSize,
     total,
   });
+});
+
+// Admin cancellation of any reservation. Bypasses the customer 2h cutoff — the
+// panel exists to handle exactly the short-notice cases self-service blocks —
+// and notifies the customer in their own language.
+adminRouter.post("/reservations/:id/cancel", async (req, res) => {
+  const reservation = await adminCancelReservation(req.params.id);
+
+  audit(req, {
+    action: "reservation.cancel",
+    targetType: "Reservation",
+    targetId: reservation.id,
+    detail: { shopId: reservation.shopId, startsAt: reservation.startsAt.toISOString() },
+  });
+
+  // Best-effort, in the customer's language. Content names are localized here
+  // (notifyUser hands the build fn the recipient's lang) so the push reads the
+  // same as the app.
+  void notifyUser({
+    userId: reservation.userId,
+    type: "BOOKING_CANCELLED",
+    reservationId: reservation.id,
+    build: (lang) =>
+      bookingCancelledByShop(lang, {
+        service: localize(lang, reservation.service.name, reservation.service.nameAr, reservation.service.nameCkb),
+        shop: localize(lang, reservation.shop.name, reservation.shop.nameAr, reservation.shop.nameCkb),
+      }),
+  });
+
+  res.json({ ok: true });
+});
+
+// ---- Reviews (moderation) ----
+
+// A shop's reviews, newest first, for moderation. A review targets a shop (not
+// a barber — see the Review model) and feeds the denormalized ratingAvg that
+// drives list ordering and Barber-of-the-Week eligibility, so an abusive or
+// mistaken one is worth being able to remove.
+adminRouter.get("/shops/:id/reviews", async (req, res) => {
+  const shop = await prisma.barbershop.findUnique({
+    where: { id: req.params.id },
+    select: { id: true, name: true, ratingAvg: true, ratingCount: true },
+  });
+  if (!shop) throw ApiError.notFound("Barbershop not found");
+  const reviews = await prisma.review.findMany({
+    where: { shopId: shop.id },
+    orderBy: { createdAt: "desc" },
+    include: { user: { select: { name: true, email: true } } },
+  });
+  res.json({
+    shop,
+    reviews: reviews.map((r) => ({
+      id: r.id,
+      rating: r.rating,
+      comment: r.comment,
+      customer: r.user.name ?? r.user.email,
+      createdAt: r.createdAt.toISOString(),
+    })),
+  });
+});
+
+adminRouter.delete("/reviews/:id", async (req, res) => {
+  const review = await prisma.review.findUnique({ where: { id: req.params.id } });
+  if (!review) throw ApiError.notFound("Review not found");
+
+  // Delete and refresh the shop's denormalized aggregate in one transaction, the
+  // same way a review write maintains it (see routes/reviews.ts) — otherwise
+  // ratingAvg/ratingCount would drift from the surviving rows.
+  await prisma.$transaction(async (tx) => {
+    await tx.review.delete({ where: { id: review.id } });
+    const agg = await tx.review.aggregate({
+      where: { shopId: review.shopId },
+      _avg: { rating: true },
+      _count: true,
+    });
+    await tx.barbershop.update({
+      where: { id: review.shopId },
+      data: {
+        ratingAvg: Math.round((agg._avg.rating ?? 0) * 10) / 10,
+        ratingCount: agg._count,
+      },
+    });
+  });
+
+  audit(req, {
+    action: "review.delete",
+    targetType: "Review",
+    targetId: review.id,
+    detail: { shopId: review.shopId, rating: review.rating },
+  });
+  res.json({ ok: true });
+});
+
+// ---- Admin users ----
+
+// Managing who can sign in to the panel. The audit trail records actorId +
+// actorEmail on every write, so "who did this" is only meaningful once there is
+// more than one admin — until then every row carries the same shared login.
+// Disable rather than delete: the trail references these rows.
+const adminCreateSchema = z.object({
+  email: z.string().trim().email(),
+  name: z.string().trim().min(2).max(80),
+  password: z.string().min(8).max(200),
+});
+const adminUpdateSchema = z
+  .object({
+    name: z.string().trim().min(2).max(80).optional(),
+    password: z.string().min(8).max(200).optional(),
+    isActive: z.boolean().optional(),
+  })
+  .refine((v) => Object.keys(v).length > 0, { message: "Nothing to update" });
+
+adminRouter.get("/admins", async (_req, res) => {
+  const admins = await prisma.adminUser.findMany({
+    orderBy: { createdAt: "asc" },
+    select: { id: true, email: true, name: true, isActive: true, createdAt: true },
+  });
+  res.json({ admins: admins.map((a) => ({ ...a, createdAt: a.createdAt.toISOString() })) });
+});
+
+adminRouter.post("/admins", validate(adminCreateSchema), async (req, res) => {
+  const body = parsed<z.infer<typeof adminCreateSchema>>(req);
+  const email = body.email.toLowerCase();
+  const existing = await prisma.adminUser.findUnique({ where: { email } });
+  if (existing) throw ApiError.conflict("An admin with that email already exists", "ADMIN_EXISTS");
+
+  const admin = await prisma.adminUser.create({
+    data: { email, name: body.name, passwordHash: await bcrypt.hash(body.password, 10) },
+    select: { id: true, email: true, name: true, isActive: true, createdAt: true },
+  });
+  audit(req, {
+    action: "admin.create",
+    targetType: "AdminUser",
+    targetId: admin.id,
+    // Never the password or its hash.
+    detail: { email: admin.email, name: admin.name },
+  });
+  res.status(201).json({ admin: { ...admin, createdAt: admin.createdAt.toISOString() } });
+});
+
+adminRouter.patch("/admins/:id", validate(adminUpdateSchema), async (req, res) => {
+  const body = parsed<z.infer<typeof adminUpdateSchema>>(req);
+  const target = await prisma.adminUser.findUnique({ where: { id: req.params.id } });
+  if (!target) throw ApiError.notFound("Admin not found");
+
+  // Two lockout guards, both on disabling:
+  //   1. You can't disable yourself — that would end your own session's ability
+  //      to re-enable anyone.
+  //   2. You can't disable the last active admin — the panel would become
+  //      unreachable with no way back in short of the database.
+  if (body.isActive === false) {
+    if (target.id === req.auth!.userId) {
+      throw ApiError.badRequest("You can't disable your own account", "ADMIN_SELF_DISABLE");
+    }
+    if (target.isActive) {
+      const activeCount = await prisma.adminUser.count({ where: { isActive: true } });
+      if (activeCount <= 1) {
+        throw ApiError.badRequest("At least one admin must stay active", "ADMIN_LAST_ACTIVE");
+      }
+    }
+  }
+
+  const admin = await prisma.adminUser.update({
+    where: { id: target.id },
+    data: {
+      name: body.name,
+      isActive: body.isActive,
+      ...(body.password ? { passwordHash: await bcrypt.hash(body.password, 10) } : {}),
+    },
+    select: { id: true, email: true, name: true, isActive: true, createdAt: true },
+  });
+  audit(req, {
+    action: "admin.update",
+    targetType: "AdminUser",
+    targetId: admin.id,
+    // Field names only — never the new password.
+    detail: { fields: Object.keys(body) },
+  });
+  res.json({ admin: { ...admin, createdAt: admin.createdAt.toISOString() } });
+});
+
+// ---- Announcements ----
+
+// A general platform-wide announcement, delivered over the same paced broadcast
+// engine as Barber of the Week (services/broadcast.ts): feed rows written in
+// batches, pushes metered out over minutes. Guarded against overlapping runs so
+// two announcements can't double every user's feed or stack two push waves.
+const announcementSchema = z.object({
+  title: z.string().trim().min(3).max(80),
+  body: z.string().trim().min(3).max(300),
+});
+
+adminRouter.post("/announcements", validate(announcementSchema), async (req, res) => {
+  const { title, body } = parsed<z.infer<typeof announcementSchema>>(req);
+
+  if (isBroadcastRunning()) {
+    throw ApiError.conflict(
+      "Another announcement is still being delivered. Try again shortly.",
+      "BROADCAST_IN_PROGRESS",
+    );
+  }
+
+  const result = await broadcastToAllUsers({
+    type: "ANNOUNCEMENT",
+    title,
+    body,
+    data: { type: "ANNOUNCEMENT" },
+  });
+
+  audit(req, {
+    action: "announcement.send",
+    targetType: "Announcement",
+    detail: { title, users: result.users },
+  });
+
+  res.json({ ok: true, users: result.users });
 });
 
 // ---- Customers ----

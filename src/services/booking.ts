@@ -347,6 +347,43 @@ export async function cancelReservation(userId: string, reservationId: string) {
   });
 }
 
+// Admin/staff cancellation. Unlike the customer path (cancelReservation) this
+// takes no userId — an admin can cancel anyone's booking — and skips the 2h
+// cutoff, because the reason to cancel from the panel (a shop closes for the
+// day, a customer phones in) is exactly the short-notice case the cutoff blocks
+// for self-service. Everything else — the holding-status guard, the group
+// cancel, the compare-and-swap, releasing a referral pair — is the same, so a
+// booking cancelled by staff behaves identically to one the customer cancelled.
+export async function adminCancelReservation(reservationId: string) {
+  const reservation = await prisma.reservation.findUnique({ where: { id: reservationId } });
+  if (!reservation) throw ApiError.notFound("Reservation not found");
+  if (!HOLDING_STATUSES.includes(reservation.status)) {
+    throw ApiError.badRequest("Reservation can no longer be cancelled", "ALREADY_CANCELLED");
+  }
+
+  const groupWhere = reservation.groupId
+    ? { groupId: reservation.groupId, status: { in: HOLDING_STATUSES } }
+    : { id: reservationId, status: reservation.status };
+
+  const updated = await prisma.reservation.updateMany({
+    where: groupWhere,
+    data: { status: "CANCELLED" },
+  });
+  if (updated.count === 0) {
+    throw ApiError.conflict(
+      "This reservation just changed. Refresh and try again.",
+      "RESERVATION_CHANGED",
+    );
+  }
+
+  await voidPairForReservation(reservationId);
+
+  return prisma.reservation.findUniqueOrThrow({
+    where: { id: reservationId },
+    include: reservationInclude,
+  });
+}
+
 export const reservationInclude = {
   shop: {
     select: {

@@ -5,6 +5,7 @@ import { prisma } from "../src/lib/prisma.js";
 import { ApiError } from "../src/lib/errors.js";
 import { weekdayOfLocalDate } from "../src/lib/time.js";
 import { verifyGoogleIdToken } from "../src/lib/googleAuth.js";
+import { isBroadcastRunning } from "../src/services/broadcast.js";
 
 // Real verification needs Google credentials; tests inject identities instead.
 vi.mock("../src/lib/googleAuth.js", () => ({
@@ -939,6 +940,362 @@ describe("barber of the week broadcast", () => {
     expect(feed.status).toBe(200);
     expect(feed.body.shops.map((s: { id: string }) => s.id)).toContain(shopId);
     expect(feed.headers["cache-control"]).toContain("max-age");
+  });
+});
+
+describe("admin: reservations filter + cancel", () => {
+  let resvId: string;
+  let resvUserId: string;
+
+  it("creates a confirmed booking to act on", async () => {
+    const user = await prisma.user.create({
+      data: { email: `resv-${Date.now()}@phone.migrated`, name: "Resv Customer" },
+    });
+    resvUserId = user.id;
+    const start = new Date(Date.now() + 3 * 86_400_000);
+    const resv = await prisma.reservation.create({
+      data: {
+        userId: user.id,
+        shopId,
+        serviceId,
+        price: 15_000,
+        startsAt: start,
+        endsAt: new Date(start.getTime() + 30 * 60_000),
+        status: "CONFIRMED",
+      },
+    });
+    resvId = resv.id;
+  });
+
+  it("filters by status and date range", async () => {
+    const byStatus = await request(app)
+      .get("/api/admin/reservations")
+      .query({ status: "CONFIRMED", shopId })
+      .set(auth(adminToken));
+    expect(byStatus.status).toBe(200);
+    expect(byStatus.body.reservations.every((r: { status: string }) => r.status === "CONFIRMED")).toBe(true);
+    expect(byStatus.body.reservations.some((r: { id: string }) => r.id === resvId)).toBe(true);
+
+    // A window that ends before the booking excludes it.
+    const past = await request(app)
+      .get("/api/admin/reservations")
+      .query({ to: new Date(Date.now() + 86_400_000).toISOString(), shopId })
+      .set(auth(adminToken));
+    expect(past.body.reservations.some((r: { id: string }) => r.id === resvId)).toBe(false);
+  });
+
+  it("admin-cancels a booking, bypassing the customer cutoff, and notifies", async () => {
+    const before = await prisma.notification.count({
+      where: { userId: resvUserId, type: "BOOKING_CANCELLED" },
+    });
+    const res = await request(app)
+      .post(`/api/admin/reservations/${resvId}/cancel`)
+      .set(auth(adminToken));
+    expect(res.status).toBe(200);
+
+    const row = await prisma.reservation.findUniqueOrThrow({ where: { id: resvId } });
+    expect(row.status).toBe("CANCELLED");
+
+    // The customer notification is written fire-and-forget (void notifyUser),
+    // so it lands just after the response — poll briefly for it.
+    let after = before;
+    for (let i = 0; i < 50 && after === before; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+      after = await prisma.notification.count({
+        where: { userId: resvUserId, type: "BOOKING_CANCELLED" },
+      });
+    }
+    expect(after - before).toBe(1);
+  });
+
+  it("refuses to cancel an already-cancelled booking", async () => {
+    const res = await request(app)
+      .post(`/api/admin/reservations/${resvId}/cancel`)
+      .set(auth(adminToken));
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("ALREADY_CANCELLED");
+  });
+
+  it("rejects a customer token", async () => {
+    const res = await request(app)
+      .post(`/api/admin/reservations/${resvId}/cancel`)
+      .set(auth(userToken));
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("admin: plan active-subscriber count", () => {
+  it("counts only ACTIVE, unexpired subscriptions — not cancelled ones", async () => {
+    const plan = await request(app)
+      .post("/api/admin/plans")
+      .set(auth(adminToken))
+      .send({ name: `Count Plan ${Date.now()}`, monthlyPrice: 30_000, features: "" });
+    const planId2 = plan.body.plan.id as string;
+
+    const shop = await request(app)
+      .post("/api/admin/shops")
+      .set(auth(adminToken))
+      .send({
+        name: `Count Shop ${Date.now()}`,
+        description: "Counts subscribers correctly.",
+        address: "9 Count Street",
+        phone: "+9647500009999",
+        cityId,
+        chairCount: 1,
+        openingHours: [{ weekday: 1, openMinute: 540, closeMinute: 1080 }],
+        services: [{ name: "Cut", durationMin: 30, price: 10_000, isActive: true }],
+      });
+    const shopId2 = shop.body.shop.id as string;
+
+    await request(app)
+      .put(`/api/admin/shops/${shopId2}/subscription`)
+      .set(auth(adminToken))
+      .send({ planId: planId2, months: 2 });
+
+    const read = () =>
+      request(app).get("/api/admin/plans").set(auth(adminToken))
+        .then((r) => r.body.plans.find((x: { id: string }) => x.id === planId2));
+
+    let row = await read();
+    expect(row.activeSubscriberCount).toBe(1);
+    expect(row.subscriberCount).toBe(1);
+
+    // Cancel → the row stays (status CANCELLED) so subscriberCount still sees
+    // it, but activeSubscriberCount must drop to zero.
+    await request(app).delete(`/api/admin/shops/${shopId2}/subscription`).set(auth(adminToken));
+    row = await read();
+    expect(row.activeSubscriberCount).toBe(0);
+    expect(row.subscriberCount).toBe(1);
+  });
+});
+
+describe("admin: announcements", () => {
+  it("broadcasts to every user over the paced engine", async () => {
+    // Wait for any broadcast still draining from an earlier test — the engine
+    // is single-flight and would 409 otherwise.
+    for (let i = 0; i < 50 && isBroadcastRunning(); i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    const users = await prisma.user.count();
+    const before = await prisma.notification.count({ where: { type: "ANNOUNCEMENT" } });
+
+    const res = await request(app)
+      .post("/api/admin/announcements")
+      .set(auth(adminToken))
+      .send({ title: "Eid hours", body: "We are open 10am to 4pm during Eid." });
+    expect(res.status).toBe(200);
+    expect(res.body.users).toBe(users);
+
+    const after = await prisma.notification.count({ where: { type: "ANNOUNCEMENT" } });
+    expect(after - before).toBe(users);
+  });
+
+  it("validates title and body", async () => {
+    const res = await request(app)
+      .post("/api/admin/announcements")
+      .set(auth(adminToken))
+      .send({ title: "x", body: "" });
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects a customer token", async () => {
+    const res = await request(app)
+      .post("/api/admin/announcements")
+      .set(auth(userToken))
+      .send({ title: "Nope", body: "Should not work." });
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("admin: admin-user management", () => {
+  let secondAdminId: string;
+
+  it("creates a second admin who can then log in", async () => {
+    const res = await request(app)
+      .post("/api/admin/admins")
+      .set(auth(adminToken))
+      .send({ email: "second@test.dev", name: "Second Admin", password: "second-pass-1" });
+    expect(res.status).toBe(201);
+    secondAdminId = res.body.admin.id;
+    expect(res.body.admin.isActive).toBe(true);
+
+    const login = await request(app)
+      .post("/api/admin/login")
+      .send({ email: "second@test.dev", password: "second-pass-1" });
+    expect(login.status).toBe(200);
+  });
+
+  it("rejects a duplicate email", async () => {
+    const res = await request(app)
+      .post("/api/admin/admins")
+      .set(auth(adminToken))
+      .send({ email: "second@test.dev", name: "Dup", password: "another-pass-1" });
+    expect(res.status).toBe(409);
+  });
+
+  it("disables an admin, blocking their login", async () => {
+    const res = await request(app)
+      .patch(`/api/admin/admins/${secondAdminId}`)
+      .set(auth(adminToken))
+      .send({ isActive: false });
+    expect(res.status).toBe(200);
+    expect(res.body.admin.isActive).toBe(false);
+
+    const login = await request(app)
+      .post("/api/admin/login")
+      .send({ email: "second@test.dev", password: "second-pass-1" });
+    // Same generic error as a wrong password — no "account disabled" tell.
+    expect(login.status).toBe(401);
+    expect(login.body.error.code).toBe("BAD_CREDENTIALS");
+  });
+
+  it("won't let an admin disable their own account", async () => {
+    const me = await request(app).get("/api/admin/admins").set(auth(adminToken));
+    const selfEmail = "admin@test.dev";
+    const self = me.body.admins.find((a: { email: string }) => a.email === selfEmail);
+    const res = await request(app)
+      .patch(`/api/admin/admins/${self.id}`)
+      .set(auth(adminToken))
+      .send({ isActive: false });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("ADMIN_SELF_DISABLE");
+  });
+
+  it("refuses admin management to a customer token", async () => {
+    const res = await request(app).get("/api/admin/admins").set(auth(userToken));
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("admin: review moderation", () => {
+  it("deletes a review and recomputes the shop rating in the same transaction", async () => {
+    // Two reviewers on a throwaway shop so the average is checkable.
+    const city = await prisma.city.findFirstOrThrow();
+    const modShop = await prisma.barbershop.create({
+      data: {
+        name: "Moderation Shop",
+        description: "For review moderation tests.",
+        address: "7 Mod Street",
+        phone: "+9647500007777",
+        cityId: city.id,
+      },
+    });
+    const u1 = await prisma.user.create({ data: { email: `mod1-${Date.now()}@phone.migrated` } });
+    const u2 = await prisma.user.create({ data: { email: `mod2-${Date.now()}@phone.migrated` } });
+    await prisma.review.create({ data: { userId: u1.id, shopId: modShop.id, rating: 5, comment: "Great" } });
+    const bad = await prisma.review.create({
+      data: { userId: u2.id, shopId: modShop.id, rating: 1, comment: "Unfair one-star" },
+    });
+    // Seed the aggregate as a write would (avg of 5 and 1 = 3, count 2).
+    await prisma.barbershop.update({
+      where: { id: modShop.id },
+      data: { ratingAvg: 3, ratingCount: 2 },
+    });
+
+    const list = await request(app).get(`/api/admin/shops/${modShop.id}/reviews`).set(auth(adminToken));
+    expect(list.status).toBe(200);
+    expect(list.body.reviews).toHaveLength(2);
+
+    const del = await request(app).delete(`/api/admin/reviews/${bad.id}`).set(auth(adminToken));
+    expect(del.status).toBe(200);
+
+    const after = await prisma.barbershop.findUniqueOrThrow({ where: { id: modShop.id } });
+    // Only the 5-star survives.
+    expect(after.ratingCount).toBe(1);
+    expect(after.ratingAvg).toBe(5);
+  });
+});
+
+describe("admin: shops recent booking count", () => {
+  it("includes a 30-day reservation count per shop", async () => {
+    const res = await request(app).get("/api/admin/shops").set(auth(adminToken));
+    expect(res.status).toBe(200);
+    for (const shop of res.body.shops) {
+      expect(typeof shop.recentReservationCount).toBe("number");
+      expect(shop.recentReservationCount).toBeLessThanOrEqual(shop.reservationCount);
+    }
+  });
+});
+
+describe("admin: cities management", () => {
+  it("renames, merges, and deletes cities safely", async () => {
+    // Two throwaway cities; one gets a shop so we can test the merge path.
+    const a = await request(app).post("/api/admin/cities").set(auth(adminToken)).send({ name: "Hawler Typo" });
+    const b = await request(app).post("/api/admin/cities").set(auth(adminToken)).send({ name: "Hawler" });
+    const aId = a.body.city.id as string;
+    const bId = b.body.city.id as string;
+
+    // Rename regenerates the slug.
+    const renamed = await request(app)
+      .patch(`/api/admin/cities/${aId}`)
+      .set(auth(adminToken))
+      .send({ name: "Hawler East" });
+    expect(renamed.status).toBe(200);
+    expect(renamed.body.city.slug).toBe("hawler-east");
+
+    // Give the renamed city a shop, then try to delete it — must be refused.
+    const shop = await prisma.barbershop.create({
+      data: { name: "Merge Shop", description: "x".repeat(10), address: "1 Merge St", phone: "+9647500001111", cityId: aId },
+    });
+    const del = await request(app).delete(`/api/admin/cities/${aId}`).set(auth(adminToken));
+    expect(del.status).toBe(400);
+    expect(del.body.error.code).toBe("CITY_HAS_SHOPS");
+
+    // Merge the city with the shop into the other — the shop is reassigned.
+    const merge = await request(app)
+      .post(`/api/admin/cities/${aId}/merge`)
+      .set(auth(adminToken))
+      .send({ intoId: bId });
+    expect(merge.status).toBe(200);
+    expect(merge.body.shopsMoved).toBe(1);
+    const moved = await prisma.barbershop.findUniqueOrThrow({ where: { id: shop.id } });
+    expect(moved.cityId).toBe(bId);
+
+    // Source city is gone; target now deletable only after its shop leaves.
+    const gone = await prisma.city.findUnique({ where: { id: aId } });
+    expect(gone).toBeNull();
+  });
+
+  it("rejects city management from a customer token", async () => {
+    const res = await request(app)
+      .patch(`/api/admin/cities/${cityId}`)
+      .set(auth(userToken))
+      .send({ name: "Nope" });
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("admin: barber autoApprove via shop edit", () => {
+  it("sets and reads a barber's autoApprove flag", async () => {
+    const created = await request(app)
+      .post("/api/admin/shops")
+      .set(auth(adminToken))
+      .send({
+        name: `AutoApprove Shop ${Date.now()}`,
+        description: "Tests the autoApprove passthrough.",
+        address: "5 Auto Street",
+        phone: "+9647500005555",
+        cityId,
+        chairCount: 1,
+        openingHours: [{ weekday: 1, openMinute: 540, closeMinute: 1080 }],
+        services: [{ name: "Cut", durationMin: 30, price: 10_000, isActive: true }],
+        barbers: [{ name: "Auto Barber", email: `auto-${Date.now()}@test.dev`, isActive: true, autoApprove: true }],
+      });
+    expect(created.status).toBe(201);
+    const shopId2 = created.body.shop.id as string;
+
+    const detail = await request(app).get(`/api/admin/shops/${shopId2}`).set(auth(adminToken));
+    const barber = detail.body.shop.barbers[0];
+    expect(barber.autoApprove).toBe(true);
+
+    // Flip it off through a shop edit.
+    await request(app)
+      .patch(`/api/admin/shops/${shopId2}`)
+      .set(auth(adminToken))
+      .send({ barbers: [{ id: barber.id, name: barber.name, email: barber.email, isActive: true, autoApprove: false }] });
+    const after = await request(app).get(`/api/admin/shops/${shopId2}`).set(auth(adminToken));
+    expect(after.body.shop.barbers[0].autoApprove).toBe(false);
   });
 });
 

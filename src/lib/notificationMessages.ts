@@ -55,6 +55,29 @@ export function bookingDeclined(
   }
 }
 
+export function bookingCancelledByShop(
+  lang: Lang,
+  p: { service: string; shop: string },
+): NotificationText {
+  switch (lang) {
+    case "ar":
+      return {
+        title: "تم إلغاء الحجز",
+        body: `ألغى ${p.shop} حجزك لـ${p.service}. نعتذر عن الإزعاج.`,
+      };
+    case "ckb":
+      return {
+        title: "حجز هەڵوەشێنرایەوە",
+        body: `${p.shop} حجزەکەت بۆ ${p.service} هەڵوەشاندەوە. داوای لێبوردن دەکەین.`,
+      };
+    default:
+      return {
+        title: "Booking cancelled",
+        body: `${p.shop} cancelled your ${p.service}. We're sorry for the inconvenience.`,
+      };
+  }
+}
+
 export function newReservation(
   lang: Lang,
   p: { customer: string; service: string; pending: boolean },
