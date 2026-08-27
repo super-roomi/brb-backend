@@ -1474,3 +1474,52 @@ async function newUserToken(email: string): Promise<string> {
   const res = await request(app).post("/api/auth/test-login").send({ email });
   return res.body.accessToken;
 }
+
+describe("one-time display name", () => {
+  it("sets the name once, then blocks any change", async () => {
+    const token = await newUserToken("name-once@test.dev");
+
+    // New account: name not yet chosen.
+    const me = await request(app).get("/api/auth/me").set("Authorization", `Bearer ${token}`);
+    expect(me.body.user.nameChosen).toBe(false);
+
+    // First set succeeds and locks.
+    const set = await request(app)
+      .patch("/api/auth/me")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ name: "Rekar Aziz" });
+    expect(set.status).toBe(200);
+    expect(set.body.user.name).toBe("Rekar Aziz");
+    expect(set.body.user.nameChosen).toBe(true);
+
+    // Second attempt is refused — there is no rename.
+    const again = await request(app)
+      .patch("/api/auth/me")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ name: "Someone Else" });
+    expect(again.status).toBe(409);
+    expect(again.body.error.code).toBe("NAME_ALREADY_SET");
+  });
+
+  it("rejects a profane or slur name and leaves the name unset", async () => {
+    const token = await newUserToken("name-bad@test.dev");
+
+    const bad = await request(app)
+      .patch("/api/auth/me")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ name: "f4ggot" });
+    expect(bad.status).toBe(400);
+    expect(bad.body.error.code).toBe("NAME_REJECTED");
+
+    // Still unset, so the user can try again.
+    const me = await request(app).get("/api/auth/me").set("Authorization", `Bearer ${token}`);
+    expect(me.body.user.nameChosen).toBe(false);
+
+    const ok = await request(app)
+      .patch("/api/auth/me")
+      .set("Authorization", `Bearer ${token}`)
+      .send({ name: "Karwan" });
+    expect(ok.status).toBe(200);
+    expect(ok.body.user.nameChosen).toBe(true);
+  });
+});

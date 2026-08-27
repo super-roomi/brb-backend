@@ -10,11 +10,18 @@ import { env } from "../env.js";
 import { validate, parsed } from "../middleware/validate.js";
 import { requireUser } from "../middleware/auth.js";
 import { authLimiter } from "../middleware/rateLimit.js";
+import { assertCleanName } from "../lib/moderation.js";
 
 export const authRouter = Router();
 
 // Email every developer test session shares (see /test-login).
 export const TEST_USER_EMAIL = "tester@barberapp.dev";
+
+// The client shape for a signed-in user. `nameChosen` drives the first-login
+// name screen: while false, the app sends the user to set their name once.
+function userPayload(user: { id: string; email: string; name: string | null; nameChosen: boolean }) {
+  return { id: user.id, email: user.email, name: user.name, nameChosen: user.nameChosen };
+}
 
 const googleSchema = z.object({ idToken: z.string().min(20) });
 
@@ -32,7 +39,7 @@ authRouter.post(
     res.json({
       ...tokens,
       isNewUser,
-      user: { id: user.id, email: user.email, name: user.name },
+      user: userPayload(user),
     });
   },
 );
@@ -59,7 +66,7 @@ authRouter.post(
     res.json({
       ...tokens,
       isNewUser,
-      user: { id: user.id, email: user.email, name: user.name },
+      user: userPayload(user),
     });
   },
 );
@@ -97,7 +104,7 @@ if (env.testLoginEnabled) {
       res.json({
         ...tokens,
         isNewUser: !existing,
-        user: { id: user.id, email: user.email, name: user.name },
+        user: userPayload(user),
       });
     },
   );
@@ -148,18 +155,29 @@ authRouter.post("/logout", validate(refreshSchema), async (req, res) => {
 authRouter.get("/me", requireUser, async (req, res) => {
   const user = await prisma.user.findUnique({ where: { id: req.auth!.userId } });
   if (!user) throw ApiError.unauthorized();
-  res.json({ user: { id: user.id, email: user.email, name: user.name } });
+  res.json({ user: userPayload(user) });
 });
 
-const meSchema = z.object({ name: z.string().trim().min(2).max(60) });
+const nameSchema = z.object({ name: z.string().trim().min(2).max(60) });
 
-authRouter.patch("/me", requireUser, validate(meSchema), async (req, res) => {
-  const { name } = parsed<z.infer<typeof meSchema>>(req);
-  const user = await prisma.user.update({
-    where: { id: req.auth!.userId },
-    data: { name },
+// Set the display name. This is a ONE-TIME action taken on the first-login name
+// screen — there is no rename. The name is moderated for profanity/slurs, and a
+// compare-and-swap on `nameChosen` guarantees it can be set exactly once even if
+// two requests race: only the first flips the flag; the rest get a conflict.
+authRouter.patch("/me", requireUser, validate(nameSchema), async (req, res) => {
+  const { name } = parsed<z.infer<typeof nameSchema>>(req);
+  assertCleanName(name);
+
+  const updated = await prisma.user.updateMany({
+    where: { id: req.auth!.userId, nameChosen: false },
+    data: { name, nameChosen: true },
   });
-  res.json({ user: { id: user.id, email: user.email, name: user.name } });
+  if (updated.count === 0) {
+    throw ApiError.conflict("Your name has already been set.", "NAME_ALREADY_SET");
+  }
+
+  const user = await prisma.user.findUniqueOrThrow({ where: { id: req.auth!.userId } });
+  res.json({ user: userPayload(user) });
 });
 
 // Account deletion, required in-app by App Store guideline 5.1.1(v) and
