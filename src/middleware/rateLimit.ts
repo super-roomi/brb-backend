@@ -9,7 +9,12 @@ import { bearerToken } from "./auth.js";
 // the effective limit is currently N x the configured value, and which bucket a
 // caller lands in depends on which instance the load balancer picked.
 
-const skip = () => env.isTest;
+// Limits are off under test so the suites can hammer endpoints freely. The
+// rate-limit suite opts back in with TEST_RATE_LIMITS=1 so the real thresholds
+// are actually exercised — without that, removing a limiter from a login route
+// or raising its ceiling would not fail a single test. Read per request rather
+// than captured at import, so a suite can enable it without import-order games.
+const skip = () => env.isTest && process.env.TEST_RATE_LIMITS !== "1";
 
 // Collapse an IPv6 address to its /64 prefix. A single IPv6 client is routinely
 // handed a whole /64, so keying on the full address would let it walk its own
