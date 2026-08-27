@@ -28,10 +28,6 @@ export function beginDraining(): void {
   draining = true;
 }
 
-export function isDraining(): boolean {
-  return draining;
-}
-
 // Readiness runs on every load-balancer probe, so it must not become its own
 // load. Cache the DB check briefly: a database that just answered is
 // overwhelmingly likely to still be up 2 seconds later, and this keeps a burst

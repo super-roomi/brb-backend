@@ -5,13 +5,46 @@ import { ApiError } from "../lib/errors.js";
 import { requireUser } from "../middleware/auth.js";
 import { validate, parsed } from "../middleware/validate.js";
 import { localDayRangeUtc } from "../lib/time.js";
-import { parseLang, localize } from "../lib/localize.js";
+import { parseLang, localize, type Lang } from "../lib/localize.js";
 import { sendPushToUser } from "../lib/push.js";
 import { bookingConfirmed, bookingDeclined } from "../lib/notificationMessages.js";
 import { mintBarberToken, voidPairForReservation, QR_TTL_MS } from "../services/referral.js";
 
 export const barberRouter = Router();
 barberRouter.use(requireUser);
+
+// Shared reservation-card fields for the barber's day view and request queue.
+// Both add their own extras (a `done` flag, the shop offset), so the common
+// shape — including the discounted price and the guest/customer-name fallback —
+// lives here and can't drift between the two lists.
+function barberReservationCard(
+  r: {
+    id: string;
+    service: { name: string; nameAr: string | null; nameCkb: string | null; durationMin: number };
+    guestName: string | null;
+    user: { name: string | null; email: string };
+    price: number;
+    discountAmount: number;
+    groupId: string | null;
+    startsAt: Date;
+  },
+  lang: Lang,
+) {
+  return {
+    id: r.id,
+    serviceName: localize(lang, r.service.name, r.service.nameAr, r.service.nameCkb),
+    durationMin: r.service.durationMin,
+    // On a "book for two" double, the friend's cut carries a guest name; the
+    // initiator's own cut shows their account name like any single booking.
+    customerName: r.guestName ?? r.user.name ?? r.user.email,
+    // What to charge: the referral discount is already netted off.
+    price: r.price - r.discountAmount,
+    discountAmount: r.discountAmount,
+    // Lets the barber see at a glance this is one half of a discounted double.
+    isDouble: r.groupId !== null,
+    startsAt: r.startsAt.toISOString(),
+  };
+}
 
 // A barber is a customer (User) whose email also exists in the Barber table.
 // No separate login: they sign in with Google like anyone else, and these
@@ -229,18 +262,7 @@ barberRouter.get("/today", async (req, res) => {
   res.json({
     utcOffsetMinutes: offset,
     appointments: appts.map((r) => ({
-      id: r.id,
-      serviceName: localize(lang, r.service.name, r.service.nameAr, r.service.nameCkb),
-      durationMin: r.service.durationMin,
-      // On a "book for two" double, the friend's cut carries a guest name; the
-      // initiator's own cut shows their account name like any single booking.
-      customerName: r.guestName ?? r.user.name ?? r.user.email,
-      // What to charge: the referral discount is already netted off.
-      price: r.price - r.discountAmount,
-      discountAmount: r.discountAmount,
-      // Lets the barber see at a glance this is one half of a discounted double.
-      isDouble: r.groupId !== null,
-      startsAt: r.startsAt.toISOString(),
+      ...barberReservationCard(r, lang),
       done: r.endsAt < now,
     })),
   });
@@ -264,15 +286,7 @@ barberRouter.get("/requests", async (req, res) => {
   const lang = parseLang(req.query.lang);
   res.json({
     requests: requests.map((r) => ({
-      id: r.id,
-      serviceName: localize(lang, r.service.name, r.service.nameAr, r.service.nameCkb),
-      durationMin: r.service.durationMin,
-      customerName: r.guestName ?? r.user.name ?? r.user.email,
-      // The barber sees the discounted price and that it is part of a double.
-      price: r.price - r.discountAmount,
-      discountAmount: r.discountAmount,
-      isDouble: r.groupId !== null,
-      startsAt: r.startsAt.toISOString(),
+      ...barberReservationCard(r, lang),
       utcOffsetMinutes: r.shop.utcOffsetMinutes,
     })),
   });

@@ -7,9 +7,44 @@ import { computeFreeSlots } from "../services/availability.js";
 import { computeDoubleSlots } from "../services/doubleBooking.js";
 import { isShopLive, liveShopWhere } from "../services/booking.js";
 import { isValidDateString } from "../lib/time.js";
-import { parseLang, localize } from "../lib/localize.js";
+import { parseLang, localize, type Lang } from "../lib/localize.js";
 
 export const catalogRouter = Router();
+
+// Shared shop-card shape for the three public list endpoints (/shops,
+// /shops/of-the-week, /shops/nearby). Each endpoint spreads this and adds its
+// own extras (coordinates, tier weight, distance), so the common fields stay in
+// one place and the three lists can't drift apart.
+function shopCard(
+  s: {
+    id: string;
+    name: string;
+    nameAr: string | null;
+    nameCkb: string | null;
+    description: string;
+    descriptionAr: string | null;
+    descriptionCkb: string | null;
+    address: string;
+    imageUrl: string | null;
+    city: { id: string; name: string };
+    ratingAvg: number;
+    ratingCount: number;
+    referralDiscount: number;
+  },
+  lang: Lang,
+) {
+  return {
+    id: s.id,
+    name: localize(lang, s.name, s.nameAr, s.nameCkb),
+    description: localize(lang, s.description, s.descriptionAr, s.descriptionCkb),
+    address: s.address,
+    imageUrl: s.imageUrl,
+    city: s.city,
+    ratingAvg: s.ratingAvg,
+    ratingCount: s.ratingCount,
+    referralDiscount: s.referralDiscount,
+  };
+}
 
 catalogRouter.get("/cities", async (_req, res) => {
   const cities = await prisma.city.findMany({ orderBy: { name: "asc" } });
@@ -62,25 +97,16 @@ catalogRouter.get("/shops", validate(listSchema, "query"), async (req, res) => {
   ]);
 
   const items = shops.map((s) => ({
-    id: s.id,
-    name: localize(lang, s.name, s.nameAr, s.nameCkb),
-    description: localize(lang, s.description, s.descriptionAr, s.descriptionCkb),
-    address: s.address,
-    imageUrl: s.imageUrl,
-    city: s.city,
+    ...shopCard(s, lang),
     // Coordinates power the app's "Quick booking" nearest-shop pick. Already
     // public on the shop detail endpoint, so no new exposure.
     latitude: s.latitude,
     longitude: s.longitude,
-    ratingAvg: s.ratingAvg,
-    ratingCount: s.ratingCount,
     isFeatured: s.subscription?.plan.isFeaturedTier ?? false,
     // Subscription-tier weight for the app's quick-booking recommendation
     // (higher = better placement). The plan's monthly price doubles as the
     // ordering value; visible shops always have an active subscription.
     tierRank: s.subscription?.plan.monthlyPrice ?? 0,
-    // Lets the shop card show a "bring a friend" deal badge in the list; 0 = off.
-    referralDiscount: s.referralDiscount,
   }));
 
   // Browse traffic dwarfs writes; a short public cache absorbs repeat opens.
@@ -106,16 +132,8 @@ catalogRouter.get("/shops/of-the-week", async (req, res) => {
   res.set("Cache-Control", "public, max-age=300");
   res.json({
     shops: shops.map((s) => ({
-      id: s.id,
-      name: localize(lang, s.name, s.nameAr, s.nameCkb),
-      description: localize(lang, s.description, s.descriptionAr, s.descriptionCkb),
-      address: s.address,
-      imageUrl: s.imageUrl,
-      city: s.city,
-      ratingAvg: s.ratingAvg,
-      ratingCount: s.ratingCount,
+      ...shopCard(s, lang),
       isFeatured: true,
-      referralDiscount: s.referralDiscount,
     })),
   });
 });
@@ -176,19 +194,11 @@ catalogRouter.get("/shops/nearby", validate(nearbySchema, "query"), async (req, 
 
   res.json({
     shops: withDistance.map(({ shop: s, meters }) => ({
-      id: s.id,
-      name: localize(lang, s.name, s.nameAr, s.nameCkb),
-      description: localize(lang, s.description, s.descriptionAr, s.descriptionCkb),
-      address: s.address,
-      imageUrl: s.imageUrl,
-      city: s.city,
+      ...shopCard(s, lang),
       latitude: s.latitude,
       longitude: s.longitude,
-      ratingAvg: s.ratingAvg,
-      ratingCount: s.ratingCount,
       isFeatured: s.subscription?.plan.isFeaturedTier ?? false,
       tierRank: s.subscription?.plan.monthlyPrice ?? 0,
-      referralDiscount: s.referralDiscount,
       // Server-measured, so the client no longer needs every shop's coordinates
       // to rank them.
       distanceMeters: Math.round(meters),
