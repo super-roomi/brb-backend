@@ -7,3 +7,6 @@ dist/
 # Local pg_dump backups (e.g. taken before a migration) — real production
 # data, never belongs in git history.
 *.dump
+
+# graphify knowledge-graph output (tool artifact, regenerable)
+graphify-out/

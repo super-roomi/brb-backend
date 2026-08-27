@@ -5,6 +5,7 @@ import { ApiError } from "../lib/errors.js";
 import { logger } from "../lib/logger.js";
 import { notifyUser } from "../lib/notify.js";
 import { localize, parseLang } from "../lib/localize.js";
+import { assertCleanName } from "../lib/moderation.js";
 import { newReservation } from "../lib/notificationMessages.js";
 import { addDays, localDateToUtc, weekdayOfLocalDate } from "../lib/time.js";
 import { BOOKING_HORIZON_DAYS, BOOKING_LEAD_MIN, SLOT_STEP_MIN } from "./availability.js";
@@ -152,6 +153,12 @@ export interface DoubleBookingInput {
  * both discounted. Returns both cuts.
  */
 export async function createDoubleBooking(input: DoubleBookingInput) {
+  // The guest name is a user-supplied name shown publicly — on the friend's
+  // booking card and in the barber's day view / request queue — so it gets the
+  // same profanity/slur moderation as a display name. Guarded here rather than
+  // in the route so no future caller can persist an unmoderated name.
+  if (input.guestName) assertCleanName(input.guestName);
+
   const shop = await loadShop(input.shopId, [input.firstServiceId, input.secondServiceId]);
   if (!shop || !isShopLive(shop)) throw ApiError.notFound("Barbershop not found");
   if (shop.referralDiscount <= 0) {

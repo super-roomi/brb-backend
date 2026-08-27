@@ -104,6 +104,27 @@ describe("creating a double", () => {
     expect(rows.every((r) => r.barberId === barberId)).toBe(true);
   });
 
+  it("rejects a guest name containing a slur, and books nothing", async () => {
+    await clear();
+    const date = openDate();
+    const res = await request(app)
+      .post("/api/reservations/double")
+      .set(auth(aliceToken))
+      .send({
+        shopId,
+        date,
+        startMinute: 10 * 60,
+        firstServiceId: serviceId,
+        secondServiceId: serviceId,
+        // Leetspeak variant: normalization must catch it, not just the literal.
+        guestName: "B1g N1gga",
+      });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("NAME_REJECTED");
+    // The whole double is refused — no half-created pair left behind.
+    expect(await prisma.reservation.count({ where: { shopId } })).toBe(0);
+  });
+
   it("refuses at a shop not running the offer", async () => {
     await clear();
     await prisma.barbershop.update({ where: { id: shopId }, data: { referralDiscount: 0 } });
