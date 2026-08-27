@@ -98,12 +98,26 @@ async function deleteOldAuditLogs(limit: number): Promise<number> {
   return count;
 }
 
+// End referral promos whose window has passed. Sets referralDiscount back to 0
+// (and clears the expiry) so every reader that already treats 0 as "off" needs
+// no change — the discount simply stops applying. Not chunked: this touches at
+// most the handful of shops running a timed promo, not a growing table.
+async function expireDiscounts(): Promise<number> {
+  const { count } = await prisma.barbershop.updateMany({
+    where: { discountExpiresAt: { lt: new Date() }, referralDiscount: { gt: 0 } },
+    data: { referralDiscount: 0, discountExpiresAt: null },
+  });
+  if (count > 0) logger.info({ shops: count }, "referral promos auto-expired");
+  return count;
+}
+
 export async function runRetentionSweep(): Promise<void> {
   try {
     await deleteInChunks("RefreshToken", deleteExpiredRefreshTokens);
     await deleteInChunks("Notification", deleteOldNotifications);
     await deleteInChunks("ReferralToken", deleteExpiredReferralTokens);
     await deleteInChunks("AuditLog", deleteOldAuditLogs);
+    await expireDiscounts();
   } catch (err) {
     // Never throw from a background timer: an unhandled rejection here would
     // take down the process via the crash handler in server.ts.

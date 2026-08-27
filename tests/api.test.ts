@@ -6,6 +6,7 @@ import { ApiError } from "../src/lib/errors.js";
 import { weekdayOfLocalDate } from "../src/lib/time.js";
 import { verifyGoogleIdToken } from "../src/lib/googleAuth.js";
 import { isBroadcastRunning } from "../src/services/broadcast.js";
+import { runRetentionSweep } from "../src/services/maintenance.js";
 
 // Real verification needs Google credentials; tests inject identities instead.
 vi.mock("../src/lib/googleAuth.js", () => ({
@@ -1296,6 +1297,53 @@ describe("admin: barber autoApprove via shop edit", () => {
       .send({ barbers: [{ id: barber.id, name: barber.name, email: barber.email, isActive: true, autoApprove: false }] });
     const after = await request(app).get(`/api/admin/shops/${shopId2}`).set(auth(adminToken));
     expect(after.body.shop.barbers[0].autoApprove).toBe(false);
+  });
+});
+
+describe("discount auto-expiry", () => {
+  it("sweep zeroes a shop whose discount window passed, keeps a future one", async () => {
+    const city = await prisma.city.findFirstOrThrow();
+    const past = await prisma.barbershop.create({
+      data: {
+        name: "Expired Promo Shop", description: "x".repeat(10), address: "1 Promo St",
+        phone: "+9647500002222", cityId: city.id,
+        referralDiscount: 5000, discountExpiresAt: new Date(Date.now() - 60_000),
+      },
+    });
+    const future = await prisma.barbershop.create({
+      data: {
+        name: "Active Promo Shop", description: "x".repeat(10), address: "2 Promo St",
+        phone: "+9647500003333", cityId: city.id,
+        referralDiscount: 5000, discountExpiresAt: new Date(Date.now() + 7 * 86_400_000),
+      },
+    });
+
+    await runRetentionSweep();
+
+    const a = await prisma.barbershop.findUniqueOrThrow({ where: { id: past.id } });
+    expect(a.referralDiscount).toBe(0);
+    expect(a.discountExpiresAt).toBeNull();
+
+    const b = await prisma.barbershop.findUniqueOrThrow({ where: { id: future.id } });
+    expect(b.referralDiscount).toBe(5000);
+    expect(b.discountExpiresAt).not.toBeNull();
+  });
+
+  it("admin edit stamps an expiry the panel computed from a day count", async () => {
+    const created = await request(app)
+      .post("/api/admin/shops").set(auth(adminToken))
+      .send({
+        name: `Promo Setup ${Date.now()}`, description: "Sets a timed promo.",
+        address: "3 Promo St", phone: "+9647500004444", cityId,
+        chairCount: 1, referralDiscount: 8000,
+        discountExpiresAt: new Date(Date.now() + 3 * 86_400_000).toISOString(),
+        openingHours: [{ weekday: 1, openMinute: 540, closeMinute: 1080 }],
+        services: [{ name: "Cut", durationMin: 30, price: 10_000, isActive: true }],
+      });
+    expect(created.status).toBe(201);
+    const detail = await request(app).get(`/api/admin/shops/${created.body.shop.id}`).set(auth(adminToken));
+    expect(detail.body.shop.discountExpiresAt).not.toBeNull();
+    expect(detail.body.shop.referralDiscount).toBe(8000);
   });
 });
 

@@ -137,6 +137,11 @@ model Barbershop {
   // earnings count price - discountAmount). 0 = the promo is off for this shop,
   // which is the default: a shop only runs it once an admin sets an amount.
   referralDiscount Int             @default(0)
+  // When set, the referral promo auto-ends at this instant: the retention sweep
+  // zeroes referralDiscount (and clears this) once it passes, so every existing
+  // reader that already treats 0 as "off" needs no change. Null = no expiry
+  // (runs until an admin turns it off), which stays the default.
+  discountExpiresAt DateTime?
   createdAt        DateTime        @default(now())
   updatedAt        DateTime        @updatedAt
   services         Service[]

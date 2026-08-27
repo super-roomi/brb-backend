@@ -230,6 +230,9 @@ const shopBase = z.object({
   // the barber. 0 turns it off for this shop, which is the default — a shop only
   // runs the promo once an admin deliberately sets an amount.
   referralDiscount: z.number().int().min(0).max(1_000_000).default(0),
+  // Absolute instant the promo auto-ends (computed from a day count in the
+  // panel). Null clears any expiry. The sweep enforces it.
+  discountExpiresAt: z.coerce.date().nullable().optional(),
   latitude: z.number().min(-90).max(90).nullable().optional(),
   longitude: z.number().min(-180).max(180).nullable().optional(),
   locationLabel: trShort,
@@ -294,6 +297,7 @@ adminRouter.get("/shops", validate(shopListSchema, "query"), async (req, res) =>
       isVisible: s.isVisible,
       isLive: isShopLive(s),
       referralDiscount: s.referralDiscount,
+      discountExpiresAt: s.discountExpiresAt ? s.discountExpiresAt.toISOString() : null,
       ratingAvg: s.ratingAvg,
       ratingCount: s.ratingCount,
       reservationCount: s._count.reservations,
@@ -350,6 +354,7 @@ adminRouter.post("/shops", validate(shopBase), async (req, res) => {
         bufferMin: body.bufferMin,
         utcOffsetMinutes: body.utcOffsetMinutes,
         referralDiscount: body.referralDiscount,
+        discountExpiresAt: body.discountExpiresAt ?? null,
         latitude: body.latitude ?? null,
         longitude: body.longitude ?? null,
         locationLabel: emptyToNull(body.locationLabel) ?? null,
@@ -468,6 +473,7 @@ adminRouter.patch("/shops/:id", validate(shopBase.partial()), async (req, res) =
         bufferMin: body.bufferMin,
         utcOffsetMinutes: body.utcOffsetMinutes,
         referralDiscount: body.referralDiscount,
+        discountExpiresAt: body.discountExpiresAt,
         latitude: body.latitude,
         longitude: body.longitude,
         locationLabel: emptyToNull(body.locationLabel),
