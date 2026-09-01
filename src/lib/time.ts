@@ -34,10 +34,17 @@ export function addDays(d: Date, days: number): Date {
 export function localDayRangeUtc(
   now: Date,
   utcOffsetMinutes: number,
+  dayOffset = 0,
 ): { dayStart: Date; dayEnd: Date } {
   const local = new Date(now.getTime() + utcOffsetMinutes * 60_000);
   const dayStart = new Date(
-    Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate()) -
+    // Date.UTC normalises an out-of-range day, so +1 rolls over month and year
+    // ends on its own — no calendar arithmetic here.
+    Date.UTC(
+      local.getUTCFullYear(),
+      local.getUTCMonth(),
+      local.getUTCDate() + dayOffset,
+    ) -
       utcOffsetMinutes * 60_000,
   );
   const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60_000);

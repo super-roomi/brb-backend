@@ -421,6 +421,43 @@ describe("booking approval workflow", () => {
     expect(res.body.appointments[0].done).toBe(false);
   });
 
+  it("day=tomorrow returns the next day's appointments, not today's", async () => {
+    const cust = await prisma.user.findFirst({ where: { email: "u7508000001@test.dev" } });
+    // Noon tomorrow, so the row sits well inside the next local day whatever
+    // the shop's offset is — a boundary-hugging time would make this flaky.
+    const tomorrowNoon = new Date(Date.now() + 24 * 60 * 60_000);
+    tomorrowNoon.setUTCHours(12, 0, 0, 0);
+    const booking = await prisma.reservation.create({
+      data: {
+        userId: cust!.id,
+        shopId,
+        serviceId,
+        barberId: barberAId,
+        price: 9_000,
+        startsAt: tomorrowNoon,
+        endsAt: new Date(tomorrowNoon.getTime() + 30 * 60_000),
+        status: "CONFIRMED",
+      },
+    });
+
+    const tomorrow = await request(app)
+      .get("/api/barber/today?day=tomorrow")
+      .set(auth(barberAToken));
+    expect(tomorrow.status).toBe(200);
+    const ids = tomorrow.body.appointments.map((a: { id: string }) => a.id);
+    expect(ids).toContain(booking.id);
+    // Nothing served yet on a day that hasn't started.
+    expect(tomorrow.body.appointments.every((a: { done: boolean }) => !a.done)).toBe(true);
+
+    // The two days are disjoint: tomorrow's booking must not leak into today,
+    // and an absent/unknown param must still mean today (older clients).
+    for (const path of ["/api/barber/today", "/api/barber/today?day=whenever"]) {
+      const today = await request(app).get(path).set(auth(barberAToken));
+      expect(today.status).toBe(200);
+      expect(today.body.appointments.map((a: { id: string }) => a.id)).not.toContain(booking.id);
+    }
+  });
+
   it("rejects deciding an already-handled request", async () => {
     const cust = await newUser("u7508009007@test.dev");
     const booking = await request(app)

@@ -235,15 +235,18 @@ barberRouter.get("/stats", async (req, res) => {
   });
 });
 
-// Today's confirmed appointments for this barber (the barber's main view),
-// soonest first. "Today" is the shop's local calendar day.
+// A barber's confirmed appointments for one shop-local calendar day, soonest
+// first — their main view. `?day=tomorrow` returns the next day instead;
+// anything else (including the param being absent) means today, so older
+// clients keep the behaviour they were written against.
 barberRouter.get("/today", async (req, res) => {
   const barber = await barberForRequest(req.auth!.userId);
   if (!barber) throw ApiError.forbidden("Not registered as a barber", "NOT_A_BARBER");
 
   const offset = barber.shop.utcOffsetMinutes;
   const now = new Date();
-  const { dayStart, dayEnd } = localDayRangeUtc(now, offset);
+  const dayOffset = req.query.day === "tomorrow" ? 1 : 0;
+  const { dayStart, dayEnd } = localDayRangeUtc(now, offset, dayOffset);
 
   const appts = await prisma.reservation.findMany({
     where: {
