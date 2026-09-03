@@ -294,6 +294,7 @@ adminRouter.get("/shops", validate(shopListSchema, "query"), async (req, res) =>
       name: s.name,
       city: s.city,
       address: s.address,
+      phone: s.phone,
       isVisible: s.isVisible,
       isLive: isShopLive(s),
       referralDiscount: s.referralDiscount,
